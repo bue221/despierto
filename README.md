@@ -31,7 +31,7 @@ Con Despierto eliges cuánto tiempo te vas, cierras la tapa y todo sigue funcion
 - **⏱ Cuenta atrás en la barra de menú**, para que sepas cuánto te queda.
 - **🤖 Vigila Claude Code**: si está abierto y no has activado Despierto, te avisa de que se parará si cierras la tapa.
 - **📱 Sigue en el móvil**: un código QR para abrir Claude en el móvil y continuar tus sesiones de Claude Code.
-- **🔋 Batería a la vista**, con aviso si vas con poca y sin cargador.
+- **🔋 Batería a la vista**, con aviso si vas con poca y sin cargador. Y si baja del **10 %** sin cargador, Despierto vuelve solo a lo normal para que el Mac pueda dormirse y no se apague de golpe.
 - **🪟 Cristal transparente**: claro en modo normal y ahumado en negro ceniza cuando está activado. Funciona en modo claro y oscuro.
 - **✨ Animado con calma**: al activarlo, la taza se llena y el vapor se dibuja y sube en bucle. Respeta «Reducir movimiento» de macOS.
 - Opción de **abrirse al iniciar sesión**.
@@ -114,7 +114,7 @@ Todo el código está en [`main.swift`](main.swift), con comentarios en español
 ## ⚠️ Ojo
 
 - **No metas el Mac en la mochila** con el modo despierto activado: se puede calentar mucho.
-- Con la tapa cerrada sigue gastando batería, así que mejor enchufado.
+- Con la tapa cerrada sigue gastando batería, así que mejor enchufado. Si baja del 10 % sin cargador, vuelve solo a lo normal (siempre que la app esté abierta).
 - Si eliges **∞ (sin límite)**, acuérdate de volver a lo normal.
 
 ## Publicar una versión nueva

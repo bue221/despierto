@@ -372,6 +372,7 @@ final class Despierto: ObservableObject {
     @Published var selectedSessionID: String?
     @Published var launchAtLogin = false
     @Published var errorMessage: String?
+    @Published var notice: String?               // aviso tranquilo (no es un error), p. ej. tras volver solo a lo normal
     @Published var brewedAt = Date.distantPast   // cuándo se activó (arranca la animación del vapor)
     @Published var authorizing = false           // pidiendo la contraseña
     @Published var needsSetup = false            // aún no se ha dado el permiso de una sola vez
@@ -422,6 +423,12 @@ final class Despierto: ObservableObject {
     // MARK: Acciones
 
     func start(minutes: Int?) {
+        // Con la batería casi agotada y sin cargador volvería a lo normal enseguida
+        if let battery = System.battery(), Self.batteryTooLow(battery) {
+            errorMessage = "Queda un \(battery.percent) % de batería. Enchufa el Mac para activarlo."
+            return
+        }
+        notice = nil
         cancelTimer()
         if System.sudoPmset(1) {
             if let minutes { startTimer(minutes: minutes) }
@@ -507,6 +514,29 @@ final class Despierto: ObservableObject {
         }
     }
 
+    // MARK: Batería baja
+
+    /// Con la batería a este nivel o menos, y sin cargador, vuelve solo a lo normal.
+    static let lowBatteryLimit = 10
+
+    static func batteryTooLow(_ battery: Battery) -> Bool {
+        !battery.charging && battery.percent <= lowBatteryLimit
+    }
+
+    static func lowBatteryNotice(percent: Int, at date: Date) -> String {
+        "A las \(date.formatted(date: .omitted, time: .shortened)), con la batería al \(percent) %, "
+            + "volvió solo a lo normal para que el Mac pudiera dormirse."
+    }
+
+    /// Batería casi agotada y sin cargador: vuelve a lo normal para que el Mac pueda dormirse.
+    /// Solo con el permiso sin contraseña: con la tapa cerrada nadie podría escribirla.
+    private func returnToNormal(lowBattery battery: Battery) {
+        guard System.sudoPmset(0) else { return }
+        cancelTimer()
+        isAwake = false
+        notice = Self.lowBatteryNotice(percent: battery.percent, at: Date())
+    }
+
     /// Para el temporizador anterior (solo si de verdad es el nuestro).
     private func cancelTimer() {
         let pid = Int32(UserDefaults.standard.integer(forKey: "timerPID"))
@@ -537,6 +567,7 @@ final class Despierto: ObservableObject {
         isAwake = System.sleepDisabled()
         if isAwake && !wasAwake { brewedAt = Date() }
         battery = System.battery()
+        if isAwake, let battery, Self.batteryTooLow(battery) { returnToNormal(lowBattery: battery) }
         claudeCodeOpen = System.claudeCodeRunning()
         let sessions = System.claudeSessions()
         openSessionCount = sessions.open
@@ -737,6 +768,16 @@ struct PanelView: View {
                     .padding(.top, 12)
                     .transition(.opacity)
             }
+            if let notice = model.notice {
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Image(systemName: "battery.25percent")
+                    Text(notice).fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .padding(.top, 12)
+                .transition(.opacity)
+            }
             Hairline().padding(.top, 16).padding(.bottom, 12)
             Footer()
         }
@@ -745,6 +786,7 @@ struct PanelView: View {
         .animation(Motion.curve(Motion.standard), value: model.isAwake)
         .animation(Motion.curve(Motion.standard), value: model.claudeCodeOpen)
         .animation(Motion.curve(Motion.standard), value: model.errorMessage)
+        .animation(Motion.curve(Motion.standard), value: model.notice)
     }
 }
 
@@ -1332,6 +1374,12 @@ enum Snapshot {
         model.claudeCodeOpen = true
         model.openSessionCount = 3
         model.needsSetup = args.contains("--needs-setup")
+        // `--low-battery`: el aviso de cuando vuelve solo a lo normal por batería baja
+        if args.contains("--low-battery") {
+            model.battery = Battery(percent: Despierto.lowBatteryLimit, charging: false)
+            model.notice = Despierto.lowBatteryNotice(percent: Despierto.lowBatteryLimit,
+                                                      at: Calendar.current.date(bySettingHour: 18, minute: 42, second: 0, of: Date()) ?? Date())
+        }
         // `--brew-t 0.3`: dibuja el vapor como se ve 0,3 s después de activarlo
         let brewT = args.firstIndex(of: "--brew-t").flatMap { args.indices.contains($0 + 1) ? Double(args[$0 + 1]) : nil } ?? 1.3
         model.brewedAt = model.now.addingTimeInterval(-brewT)

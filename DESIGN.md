@@ -39,6 +39,7 @@ SF del sistema. SF Rounded solo en el título de estado (17 semibold) y la cuent
 - **Volver a lo normal**: botón de contorno, 30 pt, radio 9, borde `primary` 20 %.
 - **Filas** (Claude Code, móvil): sin tarjetas; columna de icono de 20 pt, título + descripción, separadas 16 pt. QR 58 pt sobre blanco, radio 9.
 - **Pie**: batería, «Abrir al iniciar», salir (círculo 24 pt).
+- **Aviso tranquilo** (p. ej. «volvió solo a lo normal» por batería baja): 11 pt, `secondary`, con icono de batería; no es un error, así que nada de rojo.
 - Pulsación: ver «Movimiento».
 
 ## Barra de menú

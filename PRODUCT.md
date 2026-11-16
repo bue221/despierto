@@ -31,4 +31,4 @@ App de barra de menú de macOS. Se usa en segundos, justo antes de levantarse. C
 ## Product Principles
 - Se entiende en un vistazo: el estado se ve antes que cualquier botón.
 - Nunca deja el Mac despierto sin que lo sepas.
-- Seguridad primero: avisar de batería y calor, nunca guardar la contraseña.
+- Seguridad primero: avisar de batería y calor, nunca guardar la contraseña. Con la batería al 10 % o menos y sin cargador, vuelve solo a lo normal.
