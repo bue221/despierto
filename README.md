@@ -128,11 +128,6 @@ gh release create vX.Y.Z build/release/Despierto.zip --title "Despierto X.Y.Z"
 
 `release.sh` compila la app para Apple Silicon e Intel y la empaqueta en un zip. El botón de descarga y el instalador siempre bajan la última versión publicada.
 
-## Ideas para seguir
-
-- Aviso en el móvil cuando la IA termine.
-- Atajo de teclado global.
-
 ---
 
 Vibecodeado con [Claude Code](https://claude.com/claude-code).
