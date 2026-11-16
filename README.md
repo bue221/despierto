@@ -37,9 +37,7 @@ Con Despierto eliges cuánto tiempo te vas, cierras la tapa y todo sigue funcion
 - Opción de **abrirse al iniciar sesión**.
 
 <p align="center">
-  <img src="docs/normal.png" width="300" alt="Panel en modo normal, con el cristal claro">
-  &nbsp;
-  <img src="docs/pausa-cafe.png" width="300" alt="Panel en pausa café, con el cristal ahumado en negro ceniza y la cuenta atrás">
+  <img src="docs/barra.png" width="720" alt="Capturas reales de la barra de menú: a la izquierda, el panel en modo normal con el cristal claro; a la derecha, despierto, con el cristal ahumado en negro ceniza y la taza humeante resaltada arriba">
 </p>
 
 | Icono arriba | Qué significa |
