@@ -10,6 +10,11 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/laulys/despierto/releases/latest/download/Despierto.zip"><img src="https://img.shields.io/badge/Descargar_para_macOS-141413?style=for-the-badge&logo=apple&logoColor=ECEAE6" alt="Descargar para macOS" height="40"></a>
+  <br><sub>macOS 13 o posterior · Apple Silicon e Intel · <a href="#instalación">cómo instalarla</a></sub>
+</p>
+
+<p align="center">
   <img src="docs/demo.gif" width="376" alt="Animación: el panel pasa de modo normal a pausa café; la taza se llena, sale vapor, el cristal se ahúma y empieza la cuenta atrás">
   <br><sub>Animación dibujada por la propia app (el fondo de escritorio es simulado).</sub>
 </p>
@@ -45,7 +50,25 @@ Con Despierto eliges cuánto tiempo te vas, cierras la tapa y todo sigue funcion
 
 ## Instalación
 
-Necesitas macOS 13 o posterior y las herramientas de Xcode (`xcode-select --install`).
+Funciona en macOS 13 o posterior, en Mac con Apple Silicon o Intel.
+
+### Opción 1 · Una línea en la terminal (recomendada)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/laulys/despierto/main/install.sh | bash
+```
+
+Descarga la última versión, la copia a **Aplicaciones** y la abre. Así macOS no muestra el aviso de app sin verificar. Si quieres, [lee el script](install.sh) antes: es corto.
+
+### Opción 2 · Descargar
+
+1. Pulsa **[Descargar para macOS](https://github.com/laulys/despierto/releases/latest/download/Despierto.zip)** y descomprime el zip.
+2. Arrastra **Despierto** a tu carpeta **Aplicaciones**.
+3. Ábrela. La app no está firmada por Apple, así que la primera vez macOS dirá que no puede verificarla. Pulsa **Hecho**, ve a **Ajustes del Sistema → Privacidad y seguridad**, baja hasta el aviso de Despierto y pulsa **Abrir igualmente**. Solo hace falta una vez.
+
+### Opción 3 · Compilarla tú
+
+Necesitas las herramientas de Xcode (`xcode-select --install`).
 
 ```bash
 git clone https://github.com/laulys/despierto.git
@@ -54,7 +77,7 @@ cd despierto
 open build/Despierto.app
 ```
 
-Si la vas a usar a diario, arrastra `build/Despierto.app` a **Aplicaciones** y marca «Abrir al iniciar».
+Si la vas a usar a diario, marca **«Abrir al iniciar»** en el panel.
 
 ## Seguir el chat en el móvil 📱
 
@@ -95,6 +118,15 @@ Todo el código está en [`main.swift`](main.swift), con comentarios en español
 - **No metas el Mac en la mochila** con el modo despierto activado: se puede calentar mucho.
 - Con la tapa cerrada sigue gastando batería, así que mejor enchufado.
 - Si eliges **∞ (sin límite)**, acuérdate de volver a lo normal.
+
+## Publicar una versión nueva
+
+```bash
+./release.sh
+gh release create vX.Y.Z build/release/Despierto.zip --title "Despierto X.Y.Z"
+```
+
+`release.sh` compila la app para Apple Silicon e Intel y la empaqueta en un zip. El botón de descarga y el instalador siempre bajan la última versión publicada.
 
 ## Ideas para seguir
 
