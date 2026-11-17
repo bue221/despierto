@@ -25,7 +25,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Despierto usa la red local para que puedas apagarlo desde el móvil con un código QR.</string>
+	<string>Despierto publica despierto.local en tu Wi‑Fi para que puedas apagarlo desde el móvil sin abrir el Mac.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_http._tcp</string>

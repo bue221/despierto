@@ -110,14 +110,16 @@ El QR abre [chatgpt.com/codex](https://chatgpt.com/codex). En el móvil usa la a
 
 ### Apagar Despierto desde el móvil (Mac cerrado / en la mochila)
 
-Pensado para seguir trabajando desde el celular y, al terminar, dejar que el Mac se duerma **sin abrir la tapa**.
+En la Wi‑Fi local Despierto publica el dominio Bonjour:
 
-1. Activá Despierto y, **antes de cerrar la tapa**, abrí el enlace en el celular (QR **Apagar desde el móvil**, o **Copiar enlace** / portapapeles universal).
-2. Dejá la pestaña abierta en Safari o agregala a Favoritos / Inicio.
-3. Cerrá el Mac y seguí con Claude / Cursor / Codex desde el móvil (misma Wi‑Fi).
-4. Cuando termines, en esa pestaña tocá **Volver a lo normal**. Despierto se apaga y el Mac puede dormirse.
+**[http://despierto.local:8787/](http://despierto.local:8787/)**
 
-No hace falta internet (solo la misma Wi‑Fi). El enlace lleva un token y solo funciona mientras Despierto está activo.
+1. Activá Despierto. En el celular (misma Wi‑Fi) abrí esa URL — QR, **Copiar despierto.local**, o escríbila en Safari.
+2. Agregala a Favoritos / Inicio. No hace falta mirar el Mac otra vez.
+3. Cerrá la tapa y seguí con Claude / Cursor / Codex desde el móvil.
+4. Al terminar, abrí `despierto.local` y tocá **Volver a lo normal**. El Mac puede dormirse.
+
+Solo funciona en la misma red local y mientras Despierto esté activo. Si `.local` no resuelve en alguna red rara, el panel también muestra el enlace por IP.
 
 ## Cómo funciona
 

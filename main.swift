@@ -591,11 +591,11 @@ final class Despierto: ObservableObject {
         }
         remoteStopURL = remoteStop.stopURL
         remoteControlURL = remoteStop.controlURL
-        // Copia el enlace al portapapeles (Universal Clipboard → iPhone) para no depender del QR.
+        // Copia el dominio local (Universal Clipboard → iPhone).
         if let link = remoteControlURL {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(link, forType: .string)
-            notice = "Enlace para apagar copiado. Abrilo en el celular (o escaneá el QR) antes de cerrar la tapa; después podés apagar sin abrir el Mac."
+            notice = "Enlace copiado: \(RemoteStopServer.localHost). Abrilo en el celular antes de cerrar la tapa; después apagás sin abrir el Mac."
         }
     }
 
@@ -609,7 +609,7 @@ final class Despierto: ObservableObject {
         guard let link = remoteControlURL ?? remoteStopURL else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(link, forType: .string)
-        notice = "Enlace copiado. Pegalo en Notas/Safari del celular y dejalo a mano antes de cerrar la tapa."
+        notice = "Copiado \(link) — en Safari del celular: Favoritos o «Añadir a Inicio». Misma Wi‑Fi."
     }
 
     private static let setupPrompt = "Despierto necesita tu contraseña una última vez. Después ya no te la volverá a pedir."
@@ -1031,9 +1031,11 @@ enum System {
 
 // MARK: - Apagado remoto (misma Wi‑Fi)
 
-/// HTTP mínimo en la LAN: página de control para guardar en el móvil + `/stop?t=TOKEN`.
+/// HTTP mínimo en la LAN + Bonjour (`despierto.local`) para apagar desde el móvil.
 final class RemoteStopServer: @unchecked Sendable {
     static let port: UInt16 = 8787
+    /// Dominio mDNS fijo en la red local (misma Wi‑Fi).
+    static let localHost = "despierto.local"
 
     private(set) var stopURL: String?
     /// Página con botón (para bookmark / pestaña abierta). No apaga al abrirla.
@@ -1042,6 +1044,8 @@ final class RemoteStopServer: @unchecked Sendable {
     private var onStop: (() -> Void)?
     private var serverFD: Int32 = -1
     private var acceptSource: DispatchSourceRead?
+    /// `dns-sd -P` publica despierto.local → IP actual.
+    private var bonjourProcess: Process?
 
     @MainActor
     func start(token: String, onStop: @escaping () -> Void) {
@@ -1083,12 +1087,16 @@ final class RemoteStopServer: @unchecked Sendable {
         source.setCancelHandler { Darwin.close(fd) }
         source.resume()
         acceptSource = source
-        stopURL = "http://\(ip):\(Self.port)/stop?t=\(token)"
-        controlURL = "http://\(ip):\(Self.port)/?t=\(token)"
+
+        // Dominio memorable; la IP sigue resolviendo si .local falla en alguna red.
+        controlURL = "http://\(Self.localHost):\(Self.port)/"
+        stopURL = "http://\(Self.localHost):\(Self.port)/stop?t=\(token)"
+        startBonjour(ip: ip)
     }
 
     @MainActor
     func stop() {
+        stopBonjour()
         acceptSource?.cancel()
         acceptSource = nil
         if serverFD >= 0 {
@@ -1098,6 +1106,37 @@ final class RemoteStopServer: @unchecked Sendable {
         stopURL = nil
         controlURL = nil
         onStop = nil
+    }
+
+    /// Publica `despierto.local` en la LAN (Bonjour / mDNS) apuntando a esta IP.
+    private func startBonjour(ip: String) {
+        stopBonjour()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
+        // -P: servicio + hostname.local + dirección A
+        process.arguments = [
+            "-P", "Despierto", "_http._tcp", "local.",
+            "\(Self.port)", "\(Self.localHost).", ip,
+        ]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            bonjourProcess = process
+        } catch {
+            bonjourProcess = nil
+        }
+    }
+
+    private func stopBonjour() {
+        guard let process = bonjourProcess else { return }
+        bonjourProcess = nil
+        process.terminate()
+        // Por si quedó colgado tras TERM
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) {
+            if process.isRunning { process.interrupt() }
+        }
     }
 
     private func acceptClient() {
@@ -1147,8 +1186,8 @@ final class RemoteStopServer: @unchecked Sendable {
             <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
             <div style="text-align:center;padding:24px;max-width:320px">
             <h1 style="font-size:22px;margin:0 0 12px">Despierto</h1>
-            <p style="opacity:.7;margin:0 0 8px">Dejá esta pestaña abierta o agregala a Favoritos.</p>
-            <p style="opacity:.7;margin:0 0 20px">Cuando termines los cambios, tocá el botón — sin abrir el Mac.</p>
+            <p style="opacity:.7;margin:0 0 8px">despierto.local · misma Wi‑Fi</p>
+            <p style="opacity:.7;margin:0 0 20px">Favoritos o «Añadir a Inicio». Cuando termines, tocá el botón — sin abrir el Mac.</p>
             <a href="\(link)" style="display:inline-block;background:#ECEAE6;color:#141413;text-decoration:none;font-weight:600;padding:14px 20px;border-radius:12px">Volver a lo normal</a>
             </div></body>
             """
@@ -1521,12 +1560,12 @@ struct RemoteStopRow: View {
 
     private var subtitle: String {
         if !model.isAwake {
-            return "Activá un tiempo arriba. Antes de cerrar la tapa, abrí el enlace en el celular y dejalo a mano."
+            return "Activá un tiempo arriba. En el celular usá http://\(RemoteStopServer.localHost):\(RemoteStopServer.port)/ (misma Wi‑Fi)."
         }
         if phoneLink == nil {
-            return "Conectá el Mac a la misma Wi‑Fi que el celular para generar el enlace."
+            return "Conectá el Mac a la misma Wi‑Fi que el celular para publicar \(RemoteStopServer.localHost)."
         }
-        return "Antes de cerrar la tapa: abrí el enlace en el celular (QR o copiar) y dejá la pestaña. Luego apagás sin abrir el Mac."
+        return "Dominio local: \(RemoteStopServer.localHost). Abrilo en Safari del celular (o el QR), guardalo, y cuando termines tocá «Volver a lo normal» — sin abrir el Mac."
     }
 
     var body: some View {
@@ -1543,9 +1582,12 @@ struct RemoteStopRow: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .textMorph()
                 if model.isAwake, phoneLink != nil {
+                    Text("http://\(RemoteStopServer.localHost):\(RemoteStopServer.port)/")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .textSelection(.enabled)
                     Button { model.copyRemoteStopLink() } label: {
                         HStack(spacing: 5) {
-                            Text("Copiar enlace")
+                            Text("Copiar despierto.local")
                                 .font(.system(size: 11, weight: .semibold))
                             Image(systemName: "doc.on.doc")
                                 .font(.system(size: 10, weight: .semibold))
@@ -1555,7 +1597,7 @@ struct RemoteStopRow: View {
                         .background(Capsule().fill(Color.primary.opacity(0.09)))
                     }
                     .buttonStyle(PressStyle())
-                    .help("Copiá el enlace, abrilo en Safari del celular y dejá la pestaña antes de cerrar la tapa")
+                    .help("Copiá http://despierto.local:8787/ — funciona en cualquier red Wi‑Fi donde esté activo Despierto")
                 }
             }
             Spacer(minLength: 0)
