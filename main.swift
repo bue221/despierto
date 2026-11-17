@@ -389,7 +389,8 @@ enum CodingAgent: String, CaseIterable, Identifiable, Equatable {
         switch self {
         case .claude: return ["claude", "Claude"]
         case .cursor: return ["Cursor", "cursor-agent"]
-        case .codex: return ["codex", "Codex", "com.openai.codex"]
+        // ChatGPT: Remote Control oficial de Codex vive en la app de escritorio.
+        case .codex: return ["codex", "Codex", "com.openai.codex", "ChatGPT"]
         case .antigravity: return ["agy", "Antigravity"]
         }
     }
@@ -655,19 +656,21 @@ final class Despierto: ObservableObject {
 
     private func dimBrightnessForLid() {
         guard !dimmedForLid else { return }
-        if savedBrightness == nil {
-            savedBrightness = System.displayBrightness() ?? 0.5
-            UserDefaults.standard.set(Double(savedBrightness ?? 0.5), forKey: "savedBrightness")
-        }
-        if System.setDisplayBrightness(0) {
-            dimmedForLid = true
-        }
+        let current = System.displayBrightness() ?? savedBrightness ?? 0.5
+        // Solo guardamos el brillo si realmente pudimos apagarlo.
+        guard System.setDisplayBrightness(0) else { return }
+        savedBrightness = current
+        UserDefaults.standard.set(Double(current), forKey: "savedBrightness")
+        dimmedForLid = true
     }
 
     private func restoreBrightnessIfNeeded() {
         guard dimmedForLid || savedBrightness != nil else { return }
-        let level = savedBrightness ?? Float(UserDefaults.standard.double(forKey: "savedBrightness"))
-        if level > 0 { _ = System.setDisplayBrightness(max(0.01, min(1, level))) }
+        let stored = Float(UserDefaults.standard.double(forKey: "savedBrightness"))
+        let level = max(0.01, min(1, savedBrightness ?? (stored > 0 ? stored : 0.5)))
+        // Solo olvidamos el nivel guardado si el sistema aceptó el cambio;
+        // si falla (p. ej. tapa aún cerrada / DisplayServices), reintentamos luego.
+        guard System.setDisplayBrightness(level) else { return }
         dimmedForLid = false
         savedBrightness = nil
         UserDefaults.standard.removeObject(forKey: "savedBrightness")
@@ -706,11 +709,8 @@ final class Despierto: ObservableObject {
         battery = System.battery()
         if isAwake, let battery, Self.batteryTooLow(battery) { returnToNormal(lowBattery: battery) }
         openAgents = System.detectAgents()
-        // Si el destino del móvil ya no está abierto, salta al primero que sí lo esté.
-        if !openAgents.contains(where: { $0.matches(phoneTarget) }),
-           let preferred = openAgents.compactMap(\.phoneTarget).first {
-            phoneTarget = preferred
-        }
+        // Solo sugiere un destino al arrancar / si no hay ninguno elegido a mano.
+        // No pisa una elección del usuario (p. ej. ver el QR de Codex con Cursor abierto).
         let sessions = System.claudeSessions()
         openSessionCount = sessions.open
         if phoneSessions != sessions.connected { phoneSessions = sessions.connected }
@@ -1285,9 +1285,8 @@ struct PhoneRow: View {
                 PhoneTargetPicker()
                 if showClaudeSessionPicker, let session = model.selectedSession {
                     SessionPicker(selected: session)
-                } else {
-                    copyCommandButton
                 }
+                copyCommandButton
             }
             Spacer(minLength: 0)
             if let qr = QR.image(for: qrURL) {
