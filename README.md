@@ -108,9 +108,16 @@ El QR abre [chatgpt.com/codex](https://chatgpt.com/codex). En el móvil usa la a
 - En el Mac: app de ChatGPT → *Settings → Connections → Control this Mac* y empareja el teléfono con el QR de ChatGPT.
 - En la terminal: `codex remote-control start` (el panel lo copia). La configuración oficial del móvil arranca desde la app de escritorio de ChatGPT.
 
-### Apagar Despierto desde el móvil
+### Apagar Despierto desde el móvil (Mac cerrado / en la mochila)
 
-Cuando el modo despierto está activo, el panel muestra **Apagar desde el móvil** con un QR. Escánelo con la cámara (teléfono y Mac en la **misma Wi‑Fi**): abre una página local y Despierto vuelve a lo normal. No hace falta internet; el enlace lleva un token y solo funciona mientras la app está abierta y activa.
+Pensado para seguir trabajando desde el celular y, al terminar, dejar que el Mac se duerma **sin abrir la tapa**.
+
+1. Activá Despierto y, **antes de cerrar la tapa**, abrí el enlace en el celular (QR **Apagar desde el móvil**, o **Copiar enlace** / portapapeles universal).
+2. Dejá la pestaña abierta en Safari o agregala a Favoritos / Inicio.
+3. Cerrá el Mac y seguí con Claude / Cursor / Codex desde el móvil (misma Wi‑Fi).
+4. Cuando termines, en esa pestaña tocá **Volver a lo normal**. Despierto se apaga y el Mac puede dormirse.
+
+No hace falta internet (solo la misma Wi‑Fi). El enlace lleva un token y solo funciona mientras Despierto está activo.
 
 ## Cómo funciona
 
@@ -135,7 +142,7 @@ Todo el código está en [`main.swift`](main.swift), con comentarios en español
 
 ## ⚠️ Ojo
 
-- **No metas el Mac en la mochila** con el modo despierto activado: se puede calentar mucho.
+- Con el modo despierto en la mochila el Mac **sigue encendido** y puede calentarse: mejor poco rato y, si podés, ventilado. Cuando termines, apagalo desde el móvil.
 - Con la tapa cerrada sigue gastando batería, así que mejor enchufado. Si baja del 10 % sin cargador, vuelve solo a lo normal (siempre que la app esté abierta).
 - Apagar el brillo al cerrar la tapa **no reduce la RAM**: solo baja el gasto de pantalla/batería. Los agentes siguen usando memoria mientras trabajan.
 - Si eliges **∞ (sin límite)**, acuérdate de volver a lo normal.

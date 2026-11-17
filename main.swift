@@ -475,7 +475,8 @@ final class Despierto: ObservableObject {
     @Published var authorizing = false           // pidiendo la contraseña
     @Published var needsSetup = false            // aún no se ha dado el permiso de una sola vez
     @Published var lidClosed = false             // tapa cerrada (para apagar brillo)
-    @Published var remoteStopURL: String?        // QR/enlace para apagar desde el móvil (misma Wi‑Fi)
+    @Published var remoteStopURL: String?        // /stop?t=… (acción)
+    @Published var remoteControlURL: String?     // página del móvil para guardar/abrir sin mirar el Mac
     var onAuthorizationEnd: (() -> Void)?
     private let remoteStop = RemoteStopServer()
 
@@ -575,7 +576,7 @@ final class Despierto: ObservableObject {
         refresh()
     }
 
-    /// Mini servidor en la Wi‑Fi local: el móvil escanea el QR y Despierto vuelve a lo normal.
+    /// Mini servidor en la Wi‑Fi: el móvil guarda el enlace ANTES de cerrar la tapa y apaga después.
     private func startRemoteStopServer() {
         let token: String = {
             if let existing = UserDefaults.standard.string(forKey: "remoteStopToken"), !existing.isEmpty {
@@ -589,11 +590,26 @@ final class Despierto: ObservableObject {
             Task { @MainActor in self?.stop() }
         }
         remoteStopURL = remoteStop.stopURL
+        remoteControlURL = remoteStop.controlURL
+        // Copia el enlace al portapapeles (Universal Clipboard → iPhone) para no depender del QR.
+        if let link = remoteControlURL {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(link, forType: .string)
+            notice = "Enlace para apagar copiado. Abrilo en el celular (o escaneá el QR) antes de cerrar la tapa; después podés apagar sin abrir el Mac."
+        }
     }
 
     private func stopRemoteStopServer() {
         remoteStop.stop()
         remoteStopURL = nil
+        remoteControlURL = nil
+    }
+
+    func copyRemoteStopLink() {
+        guard let link = remoteControlURL ?? remoteStopURL else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(link, forType: .string)
+        notice = "Enlace copiado. Pegalo en Notas/Safari del celular y dejalo a mano antes de cerrar la tapa."
     }
 
     private static let setupPrompt = "Despierto necesita tu contraseña una última vez. Después ya no te la volverá a pedir."
@@ -759,7 +775,10 @@ final class Despierto: ObservableObject {
         launchAtLogin = SMAppService.mainApp.status == .enabled
         needsSetup = !FileManager.default.fileExists(atPath: System.sudoersFile)
         syncLidBrightness()
-        if isAwake { remoteStopURL = remoteStop.stopURL ?? remoteStopURL }
+        if isAwake {
+            remoteStopURL = remoteStop.stopURL ?? remoteStopURL
+            remoteControlURL = remoteStop.controlURL ?? remoteControlURL
+        }
 
         // Si ya no está despierto, o el temporizador se perdió (p. ej. al reiniciar), lo olvidamos.
         let timerLost = endDate.map { $0.timeIntervalSinceNow < -10 } ?? false
@@ -1012,11 +1031,13 @@ enum System {
 
 // MARK: - Apagado remoto (misma Wi‑Fi)
 
-/// HTTP mínimo en la LAN con sockets BSD: `GET /stop?t=TOKEN` vuelve a lo normal.
+/// HTTP mínimo en la LAN: página de control para guardar en el móvil + `/stop?t=TOKEN`.
 final class RemoteStopServer: @unchecked Sendable {
     static let port: UInt16 = 8787
 
     private(set) var stopURL: String?
+    /// Página con botón (para bookmark / pestaña abierta). No apaga al abrirla.
+    private(set) var controlURL: String?
     private var token = ""
     private var onStop: (() -> Void)?
     private var serverFD: Int32 = -1
@@ -1029,11 +1050,12 @@ final class RemoteStopServer: @unchecked Sendable {
         self.onStop = onStop
         guard let ip = System.lanIPv4() else {
             stopURL = nil
+            controlURL = nil
             return
         }
 
         let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { stopURL = nil; return }
+        guard fd >= 0 else { stopURL = nil; controlURL = nil; return }
         var reuse: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout.size(ofValue: reuse)))
 
@@ -1051,6 +1073,7 @@ final class RemoteStopServer: @unchecked Sendable {
         guard bindOK, listen(fd, 4) == 0 else {
             Darwin.close(fd)
             stopURL = nil
+            controlURL = nil
             return
         }
 
@@ -1061,6 +1084,7 @@ final class RemoteStopServer: @unchecked Sendable {
         source.resume()
         acceptSource = source
         stopURL = "http://\(ip):\(Self.port)/stop?t=\(token)"
+        controlURL = "http://\(ip):\(Self.port)/?t=\(token)"
     }
 
     @MainActor
@@ -1072,6 +1096,7 @@ final class RemoteStopServer: @unchecked Sendable {
             serverFD = -1
         }
         stopURL = nil
+        controlURL = nil
         onStop = nil
     }
 
@@ -1096,8 +1121,9 @@ final class RemoteStopServer: @unchecked Sendable {
         guard n > 0 else { return }
         let request = String(decoding: buffer.prefix(n), as: UTF8.self)
         let firstLine = request.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? ""
-        let isStop = firstLine.contains("/stop") && request.contains("t=\(token)")
-        let isHome = firstLine.hasPrefix("GET / ") || firstLine.hasPrefix("GET /?")
+        let path = firstLine.split(separator: " ").dropFirst().first.map(String.init) ?? ""
+        let isStop = path.hasPrefix("/stop") && (path.contains("t=\(token)") || request.contains("t=\(token)"))
+        let isHome = path == "/" || path.hasPrefix("/?") || path.hasPrefix("/index")
 
         let status: String
         let body: String
@@ -1108,21 +1134,22 @@ final class RemoteStopServer: @unchecked Sendable {
             <title>Despierto</title>
             <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
             <div style="text-align:center;padding:24px"><h1 style="font-size:22px;margin:0 0 8px">Listo</h1>
-            <p style="opacity:.7;margin:0">Despierto volvió a lo normal.</p></div></body>
+            <p style="opacity:.7;margin:0">Despierto volvió a lo normal. El Mac ya puede dormirse.</p></div></body>
             """
             let callback = onStop
             DispatchQueue.main.async { callback?() }
         } else if isHome {
             status = "200 OK"
-            let link = stopURL ?? "#"
+            let link = stopURL ?? "/stop?t=\(token)"
             body = """
             <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
             <title>Despierto</title>
             <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
-            <div style="text-align:center;padding:24px">
+            <div style="text-align:center;padding:24px;max-width:320px">
             <h1 style="font-size:22px;margin:0 0 12px">Despierto</h1>
-            <p style="opacity:.7;margin:0 0 20px">¿Ya terminaste? Apaga el modo despierto.</p>
-            <a href="\(link)" style="display:inline-block;background:#ECEAE6;color:#141413;text-decoration:none;font-weight:600;padding:12px 18px;border-radius:12px">Volver a lo normal</a>
+            <p style="opacity:.7;margin:0 0 8px">Dejá esta pestaña abierta o agregala a Favoritos.</p>
+            <p style="opacity:.7;margin:0 0 20px">Cuando termines los cambios, tocá el botón — sin abrir el Mac.</p>
+            <a href="\(link)" style="display:inline-block;background:#ECEAE6;color:#141413;text-decoration:none;font-weight:600;padding:14px 20px;border-radius:12px">Volver a lo normal</a>
             </div></body>
             """
         } else {
@@ -1486,26 +1513,28 @@ struct AgentsRow: View {
     }
 }
 
-/// QR para apagar Despierto desde el móvil (misma Wi‑Fi, sin internet).
+/// Enlace/QR para apagar después con el Mac cerrado (misma Wi‑Fi).
 struct RemoteStopRow: View {
     @EnvironmentObject var model: Despierto
 
+    private var phoneLink: String? { model.remoteControlURL ?? model.remoteStopURL }
+
     private var subtitle: String {
         if !model.isAwake {
-            return "Primero elige un tiempo arriba (15 min, 30 min…). Luego aparece el QR aquí."
+            return "Activá un tiempo arriba. Antes de cerrar la tapa, abrí el enlace en el celular y dejalo a mano."
         }
-        if model.remoteStopURL == nil {
-            return "Conecta el Mac a una Wi‑Fi (misma que el celular) para generar el QR."
+        if phoneLink == nil {
+            return "Conectá el Mac a la misma Wi‑Fi que el celular para generar el enlace."
         }
-        return "Misma Wi‑Fi que el Mac. Escanéalo cuando termines: Despierto vuelve a lo normal."
+        return "Antes de cerrar la tapa: abrí el enlace en el celular (QR o copiar) y dejá la pestaña. Luego apagás sin abrir el Mac."
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: model.isAwake && model.remoteStopURL != nil ? "power.circle.fill" : "power.circle")
+            Image(systemName: model.isAwake && phoneLink != nil ? "power.circle.fill" : "power.circle")
                 .font(.system(size: 14, weight: .semibold))
                 .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 6) {
                 Text("Apagar desde el móvil")
                     .font(.system(size: 13, weight: .semibold))
                 Text(subtitle)
@@ -1513,9 +1542,24 @@ struct RemoteStopRow: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .textMorph()
+                if model.isAwake, phoneLink != nil {
+                    Button { model.copyRemoteStopLink() } label: {
+                        HStack(spacing: 5) {
+                            Text("Copiar enlace")
+                                .font(.system(size: 11, weight: .semibold))
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(Color.primary.opacity(0.09)))
+                    }
+                    .buttonStyle(PressStyle())
+                    .help("Copiá el enlace, abrilo en Safari del celular y dejá la pestaña antes de cerrar la tapa")
+                }
             }
             Spacer(minLength: 0)
-            if model.isAwake, let url = model.remoteStopURL, let qr = QR.image(for: url) {
+            if model.isAwake, let url = phoneLink, let qr = QR.image(for: url) {
                 Image(decorative: qr, scale: 1)
                     .interpolation(.none)
                     .resizable()
@@ -1523,7 +1567,7 @@ struct RemoteStopRow: View {
                     .padding(5)
                     .background(.white, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                     .help(url)
-                    .accessibilityLabel("Código QR para apagar Despierto desde el móvil")
+                    .accessibilityLabel("Código QR: abrí esta página en el móvil antes de cerrar la tapa")
             }
         }
     }
