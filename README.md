@@ -21,7 +21,7 @@
 
 ## ¿Para qué?
 
-Estás vibecodeando con **Claude Code**, **Codex** o **Cursor**, te apetece un café y cierras el portátil… y la sesión se corta. 😩
+Estás vibecodeando con **Claude Code**, **Cursor**, **Codex** o **Antigravity**, te apetece un café y cierras el portátil… y la sesión se corta. 😩
 
 Con Despierto eliges cuánto tiempo te vas, cierras la tapa y todo sigue funcionando. Y si quieres, **continúas el chat desde el móvil**.
 
@@ -29,8 +29,9 @@ Con Despierto eliges cuánto tiempo te vas, cierras la tapa y todo sigue funcion
 
 - **☕ Pausa café**: elige 15 min, 30 min, 1 h, 2 h o sin límite. Cuando se acaba el tiempo, el Mac vuelve solo a lo normal, aunque la tapa siga cerrada.
 - **⏱ Cuenta atrás en la barra de menú**, para que sepas cuánto te queda.
-- **🤖 Vigila Claude Code**: si está abierto y no has activado Despierto, te avisa de que se parará si cierras la tapa.
-- **📱 Sigue en el móvil**: un código QR para abrir Claude en el móvil y continuar tus sesiones de Claude Code.
+- **🤖 Vigila tus agentes**: si tienes abierto Claude Code, Cursor, Codex o Antigravity (`agy`) y no has activado Despierto, te avisa de que se pararán si cierras la tapa.
+- **📱 Sigue en el móvil**: elige Claude, Cursor o Codex y escanea el QR (o copia el comando de Remote Control) para continuar desde el teléfono.
+- **🔅 Brillo a 0 con la tapa cerrada**: con Despierto activo, al cerrar la tapa apaga el brillo de la pantalla integrada (ahorro de batería/pantalla; no reduce la RAM). Al abrirla, lo restaura.
 - **🔋 Batería a la vista**, con aviso si vas con poca y sin cargador. Y si baja del **10 %** sin cargador, Despierto vuelve solo a lo normal para que el Mac pueda dormirse y no se apague de golpe.
 - **🪟 Cristal transparente**: claro en modo normal y ahumado en negro ceniza cuando está activado. Funciona en modo claro y oscuro.
 - **✨ Animado con calma**: al activarlo, la taza se llena y el vapor se dibuja y sube en bucle. Respeta «Reducir movimiento» de macOS.
@@ -79,16 +80,32 @@ Si la vas a usar a diario, marca **«Abrir al iniciar»** en el panel.
 
 ## Seguir el chat en el móvil 📱
 
-Usa **Remote Control** de Claude Code: tus sesiones del Mac aparecen en la app de Claude del móvil (o en [claude.ai/code](https://claude.ai/code)) y puedes seguir escribiendo desde ahí.
+En el panel elige **Claude**, **Cursor** o **Codex**. El QR y el botón de copiar cambian con el destino. El Mac tiene que seguir encendido: para eso está Despierto. 😉
+
+### Claude Code
+
+Usa **Remote Control** de Claude Code: tus sesiones del Mac aparecen en la app de Claude del móvil (o en [claude.ai/code](https://claude.ai/code)).
 
 - **En la app de escritorio de Claude**: activa *Settings → Claude Code → Connect new sessions to Remote Control*.
 - **En la terminal**: escribe `/remote-control` dentro de una sesión (el panel tiene un botón para copiarlo) o empieza con `claude --remote-control`.
 
-El QR de Despierto lleva al chat que está trabajando (o al más reciente). Si tienes varios conectados, pulsa su nombre para elegir otro.
+El QR lleva al chat que está trabajando (o al más reciente). Si tienes varios conectados, pulsa su nombre para elegir otro.
 
 > **Si el móvil solo abre la app de Claude:** es un fallo conocido de la app con los enlaces de Remote Control (también pasa con el QR oficial de Claude Code). Entra en la pestaña **Code** y elige el chat con el nombre que muestra Despierto.
 
-El Mac tiene que seguir encendido para que la sesión funcione. Para eso está Despierto. 😉
+### Cursor
+
+El QR abre [cursor.com/agents](https://cursor.com/agents). En el iPhone usa la [app de Cursor](https://cursor.com/mobile), inicia sesión con la misma cuenta, empareja este Mac y elige el agente local.
+
+- Activa *Settings → Agents → Remote Control* en el escritorio.
+- En el Agents Window puedes escribir `/remote-control` (también se copia desde el panel).
+
+### Codex
+
+El QR abre [chatgpt.com/codex](https://chatgpt.com/codex). En el móvil usa la app de ChatGPT → **Codex** (o **Remote** en versiones anteriores).
+
+- En el Mac: app de ChatGPT → *Settings → Connections → Control this Mac* y empareja el teléfono con el QR de ChatGPT.
+- En la terminal: `codex remote-control start` (el panel lo copia). La configuración oficial del móvil arranca desde la app de escritorio de ChatGPT.
 
 ## Cómo funciona
 
@@ -115,6 +132,7 @@ Todo el código está en [`main.swift`](main.swift), con comentarios en español
 
 - **No metas el Mac en la mochila** con el modo despierto activado: se puede calentar mucho.
 - Con la tapa cerrada sigue gastando batería, así que mejor enchufado. Si baja del 10 % sin cargador, vuelve solo a lo normal (siempre que la app esté abierta).
+- Apagar el brillo al cerrar la tapa **no reduce la RAM**: solo baja el gasto de pantalla/batería. Los agentes siguen usando memoria mientras trabajan.
 - Si eliges **∞ (sin límite)**, acuérdate de volver a lo normal.
 
 ## Publicar una versión nueva

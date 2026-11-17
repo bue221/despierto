@@ -14,6 +14,14 @@ import Combine
 import ServiceManagement
 import CoreImage
 import CoreImage.CIFilterBuiltins
+import IOKit
+import CoreGraphics
+
+// DisplayServices: API privada del brillo del panel integrado (sin IOKit.graphics).
+@_silgen_name("DisplayServicesGetBrightness")
+func DisplayServicesGetBrightness(_ display: CGDirectDisplayID, _ brightness: UnsafeMutablePointer<Float>) -> Int32
+@_silgen_name("DisplayServicesSetBrightness")
+func DisplayServicesSetBrightness(_ display: CGDirectDisplayID, _ brightness: Float) -> Int32
 
 // MARK: - Punto de entrada
 
@@ -29,8 +37,10 @@ enum Main {
         }
         // `Despierto --list-sessions`: muestra los chats que se pueden abrir en el móvil.
         if args.contains("--list-sessions") {
+            let agents = System.detectAgents()
+            print("Agentes abiertos: \(agents.isEmpty ? "ninguno" : agents.map(\.title).joined(separator: ", "))")
             let sessions = System.claudeSessions()
-            print("Chats abiertos: \(sessions.open) · conectados al móvil: \(sessions.connected.count)")
+            print("Claude Code · chats abiertos: \(sessions.open) · conectados al móvil: \(sessions.connected.count)")
             for s in sessions.connected { print("  \(s.busy ? "●" : "○") \(s.name) → \(s.url)") }
             return
         }
@@ -359,6 +369,83 @@ struct ClaudeSession: Identifiable, Equatable {
     var url: String { "https://claude.ai/code/\(id)" }
 }
 
+/// Agentes de código que Despierto puede vigilar mientras están abiertos.
+enum CodingAgent: String, CaseIterable, Identifiable, Equatable {
+    case claude, cursor, codex, antigravity
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .claude: return "Claude Code"
+        case .cursor: return "Cursor"
+        case .codex: return "Codex"
+        case .antigravity: return "Antigravity"
+        }
+    }
+
+    /// Nombres de proceso (`ps -axo comm=`, último componente del path).
+    var processNames: Set<String> {
+        switch self {
+        case .claude: return ["claude", "Claude"]
+        case .cursor: return ["Cursor", "cursor-agent"]
+        case .codex: return ["codex", "Codex", "com.openai.codex"]
+        case .antigravity: return ["agy", "Antigravity"]
+        }
+    }
+
+    /// Destino de Remote Control en el móvil (Antigravity aún no tiene portal aquí).
+    var phoneTarget: PhoneTarget? {
+        switch self {
+        case .claude: return .claude
+        case .cursor: return .cursor
+        case .codex: return .codex
+        case .antigravity: return nil
+        }
+    }
+
+    func matches(_ target: PhoneTarget) -> Bool { phoneTarget == target }
+}
+
+/// Destino del QR / instrucciones para seguir el chat en el móvil.
+enum PhoneTarget: String, CaseIterable, Identifiable, Equatable {
+    case claude, cursor, codex
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .claude: return "Claude"
+        case .cursor: return "Cursor"
+        case .codex: return "Codex"
+        }
+    }
+
+    /// Enlace genérico cuando no hay sesión concreta (Cursor / Codex / Claude sin bridge).
+    var portalURL: String {
+        switch self {
+        case .claude: return "https://claude.ai/code"
+        case .cursor: return "https://cursor.com/agents"
+        case .codex: return "https://chatgpt.com/codex"
+        }
+    }
+
+    var copyCommand: String {
+        switch self {
+        case .claude, .cursor: return "/remote-control"
+        case .codex: return "codex remote-control start"
+        }
+    }
+
+    var copyHelp: String {
+        switch self {
+        case .claude: return "Cópialo y escríbelo en un chat de Claude Code en la terminal"
+        case .cursor: return "Cópialo en el Agents Window de Cursor (Settings → Agents → Remote Control)"
+        case .codex: return "Cópialo para arrancar Remote Control de Codex en la terminal"
+        }
+    }
+}
+
 @MainActor
 final class Despierto: ObservableObject {
     @Published var isAwake = false
@@ -366,21 +453,30 @@ final class Despierto: ObservableObject {
     @Published var endDate: Date?
     @Published var now = Date()
     @Published var battery: Battery?
-    @Published var claudeCodeOpen = false
-    @Published var phoneSessions: [ClaudeSession] = []   // chats que se pueden abrir en el móvil
-    @Published var openSessionCount = 0                  // chats abiertos en total
+    @Published var openAgents: [CodingAgent] = []
+    @Published var phoneSessions: [ClaudeSession] = []   // chats de Claude que se pueden abrir en el móvil
+    @Published var openSessionCount = 0                  // chats de Claude abiertos en total
     @Published var selectedSessionID: String?
+    @Published var phoneTarget: PhoneTarget = .claude
     @Published var launchAtLogin = false
     @Published var errorMessage: String?
     @Published var notice: String?               // aviso tranquilo (no es un error), p. ej. tras volver solo a lo normal
     @Published var brewedAt = Date.distantPast   // cuándo se activó (arranca la animación del vapor)
     @Published var authorizing = false           // pidiendo la contraseña
     @Published var needsSetup = false            // aún no se ha dado el permiso de una sola vez
+    @Published var lidClosed = false             // tapa cerrada (para apagar brillo)
     var onAuthorizationEnd: (() -> Void)?
 
     /// El chat elegido para el QR (por defecto, el que está trabajando o el más reciente).
     var selectedSession: ClaudeSession? {
         phoneSessions.first { $0.id == selectedSessionID } ?? phoneSessions.first
+    }
+
+    var agentsOpen: Bool { !openAgents.isEmpty }
+
+    /// Texto corto para el aviso: «Claude Code y Cursor», etc.
+    var openAgentsLabel: String {
+        Format.joinedList(openAgents.map(\.title))
     }
 
     // Temporizador «de root» (solo si no se pudo instalar el permiso, o de versiones anteriores)
@@ -392,11 +488,17 @@ final class Despierto: ObservableObject {
 
     private var ticks = 0
     private var timer: Timer?
+    /// Brillo guardado antes de apagarlo al cerrar la tapa (0…1).
+    private var savedBrightness: Float?
+    private var dimmedForLid = false
 
     init(preview: Bool = false) {
         guard !preview else { return }
         startDate = UserDefaults.standard.object(forKey: "startDate") as? Date
         endDate = UserDefaults.standard.object(forKey: "endDate") as? Date
+        if UserDefaults.standard.object(forKey: "savedBrightness") != nil {
+            savedBrightness = Float(UserDefaults.standard.double(forKey: "savedBrightness"))
+        }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
@@ -452,6 +554,7 @@ final class Despierto: ObservableObject {
             checkSetup()
         }
         saveDates(start: nil, end: nil)
+        restoreBrightnessIfNeeded()
         Haptics.tap()
         refresh()
     }
@@ -534,7 +637,46 @@ final class Despierto: ObservableObject {
         guard System.sudoPmset(0) else { return }
         cancelTimer()
         isAwake = false
+        restoreBrightnessIfNeeded()
         notice = Self.lowBatteryNotice(percent: battery.percent, at: Date())
+    }
+
+    /// Con Despierto activo y tapa cerrada: brillo a 0 (ahorro de pantalla/batería, no de RAM).
+    /// Al abrir la tapa o volver a lo normal, restaura el brillo anterior.
+    /// Se comprueba en cada `refresh` (cada ~5 s) para no depender de notificaciones del sistema.
+    private func syncLidBrightness() {
+        lidClosed = System.lidClosed()
+        if isAwake && lidClosed {
+            dimBrightnessForLid()
+        } else {
+            restoreBrightnessIfNeeded()
+        }
+    }
+
+    private func dimBrightnessForLid() {
+        guard !dimmedForLid else { return }
+        if savedBrightness == nil {
+            savedBrightness = System.displayBrightness() ?? 0.5
+            UserDefaults.standard.set(Double(savedBrightness ?? 0.5), forKey: "savedBrightness")
+        }
+        if System.setDisplayBrightness(0) {
+            dimmedForLid = true
+        }
+    }
+
+    private func restoreBrightnessIfNeeded() {
+        guard dimmedForLid || savedBrightness != nil else { return }
+        let level = savedBrightness ?? Float(UserDefaults.standard.double(forKey: "savedBrightness"))
+        if level > 0 { _ = System.setDisplayBrightness(max(0.01, min(1, level))) }
+        dimmedForLid = false
+        savedBrightness = nil
+        UserDefaults.standard.removeObject(forKey: "savedBrightness")
+    }
+
+    func copyRemoteControlCommand(for target: PhoneTarget? = nil) {
+        let command = (target ?? phoneTarget).copyCommand
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
     }
 
     /// Para el temporizador anterior (solo si de verdad es el nuestro).
@@ -555,11 +697,6 @@ final class Despierto: ObservableObject {
         refresh()
     }
 
-    func copyRemoteControlCommand() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString("/remote-control", forType: .string)
-    }
-
     // MARK: Lectura del sistema
 
     func refresh() {
@@ -568,12 +705,18 @@ final class Despierto: ObservableObject {
         if isAwake && !wasAwake { brewedAt = Date() }
         battery = System.battery()
         if isAwake, let battery, Self.batteryTooLow(battery) { returnToNormal(lowBattery: battery) }
-        claudeCodeOpen = System.claudeCodeRunning()
+        openAgents = System.detectAgents()
+        // Si el destino del móvil ya no está abierto, salta al primero que sí lo esté.
+        if !openAgents.contains(where: { $0.matches(phoneTarget) }),
+           let preferred = openAgents.compactMap(\.phoneTarget).first {
+            phoneTarget = preferred
+        }
         let sessions = System.claudeSessions()
         openSessionCount = sessions.open
         if phoneSessions != sessions.connected { phoneSessions = sessions.connected }
         launchAtLogin = SMAppService.mainApp.status == .enabled
         needsSetup = !FileManager.default.fileExists(atPath: System.sudoersFile)
+        syncLidBrightness()
 
         // Si ya no está despierto, o el temporizador se perdió (p. ej. al reiniciar), lo olvidamos.
         let timerLost = endDate.map { $0.timeIntervalSinceNow < -10 } ?? false
@@ -583,6 +726,8 @@ final class Despierto: ObservableObject {
     private func tick() {
         now = Date()
         ticks += 1
+        // Con la tapa, reaccionamos al segundo; el resto del sistema cada 5 s.
+        if isAwake || dimmedForLid { syncLidBrightness() }
         let timerJustEnded = endDate.map { $0 <= now } ?? false
         if ticks % 5 == 0 || timerJustEnded { refresh() }
     }
@@ -666,11 +811,48 @@ enum System {
         return Battery(percent: percent, charging: output.contains("AC Power"))
     }
 
-    /// ¿Hay alguna sesión de Claude Code abierta? (el proceso se llama `claude`)
-    static func claudeCodeRunning() -> Bool {
-        run("/bin/ps", ["-axo", "comm="])
+    /// Procesos en ejecución (solo el nombre del binario).
+    static func runningProcessNames() -> Set<String> {
+        Set(run("/bin/ps", ["-axo", "comm="])
             .split(separator: "\n")
-            .contains { $0.split(separator: "/").last?.trimmingCharacters(in: .whitespaces) == "claude" }
+            .compactMap { line -> String? in
+                let name = line.split(separator: "/").last?.trimmingCharacters(in: .whitespaces) ?? ""
+                return name.isEmpty ? nil : name
+            })
+    }
+
+    /// Claude Code, Cursor, Codex y Antigravity (`agy`) si están abiertos.
+    static func detectAgents() -> [CodingAgent] {
+        let names = runningProcessNames()
+        return CodingAgent.allCases.filter { agent in
+            !agent.processNames.isDisjoint(with: names)
+        }
+    }
+
+    /// ¿Tapa cerrada? (clamshell). En desktop siempre false.
+    static func lidClosed() -> Bool {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard service != 0 else { return false }
+        defer { IOObjectRelease(service) }
+        guard let raw = IORegistryEntryCreateCFProperty(
+            service, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0
+        )?.takeRetainedValue() else { return false }
+        if let flag = raw as? Bool { return flag }
+        if let number = raw as? NSNumber { return number.boolValue }
+        return false
+    }
+
+    /// Brillo del display principal (0…1). Usa DisplayServices (API privada estable en MacBooks).
+    static func displayBrightness() -> Float? {
+        var value: Float = 0
+        guard DisplayServicesGetBrightness(CGMainDisplayID(), &value) == 0 else { return nil }
+        return value
+    }
+
+    /// Pone el brillo del display principal. Devuelve false si no se pudo.
+    @discardableResult
+    static func setDisplayBrightness(_ value: Float) -> Bool {
+        DisplayServicesSetBrightness(CGMainDisplayID(), max(0, min(1, value))) == 0
     }
 
     /// Lee los chats abiertos de Claude Code (~/.claude/sessions/<pid>.json).
@@ -755,8 +937,8 @@ struct PanelView: View {
             }
             Hairline().padding(.vertical, 16)
             VStack(alignment: .leading, spacing: 16) {
-                if model.claudeCodeOpen {
-                    ClaudeRow().transition(.opacity)
+                if model.agentsOpen {
+                    AgentsRow().transition(.opacity)
                 }
                 PhoneRow()
             }
@@ -784,7 +966,8 @@ struct PanelView: View {
         .padding(18)
         .frame(width: 320)
         .animation(Motion.curve(Motion.standard), value: model.isAwake)
-        .animation(Motion.curve(Motion.standard), value: model.claudeCodeOpen)
+        .animation(Motion.curve(Motion.standard), value: model.openAgents)
+        .animation(Motion.curve(Motion.standard), value: model.phoneTarget)
         .animation(Motion.curve(Motion.standard), value: model.errorMessage)
         .animation(Motion.curve(Motion.standard), value: model.notice)
     }
@@ -1039,7 +1222,7 @@ struct ReturnButton: View {
     }
 }
 
-struct ClaudeRow: View {
+struct AgentsRow: View {
     @EnvironmentObject var model: Despierto
     @Environment(\.colorScheme) private var scheme
 
@@ -1051,9 +1234,14 @@ struct ClaudeRow: View {
                 .symbolSwap()
                 .frame(width: 20)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Claude Code está abierto")
+                Text(model.openAgents.count == 1
+                     ? "\(model.openAgentsLabel) está abierto"
+                     : "\(model.openAgentsLabel) están abiertos")
                     .font(.system(size: 13, weight: .semibold))
-                Text(model.isAwake ? "Seguirá trabajando aunque cierres la tapa" : "Si cierras la tapa ahora, se parará")
+                    .textMorph()
+                Text(model.isAwake
+                     ? "Seguirán trabajando aunque cierres la tapa"
+                     : "Si cierras la tapa ahora, se pararán")
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1068,12 +1256,23 @@ struct PhoneRow: View {
     @EnvironmentObject var model: Despierto
     @State private var copied = false
 
+    private var target: PhoneTarget { model.phoneTarget }
+
+    private var qrURL: String {
+        if target == .claude, let session = model.selectedSession { return session.url }
+        return target.portalURL
+    }
+
+    private var showClaudeSessionPicker: Bool {
+        target == .claude && model.selectedSession != nil
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: "iphone")
                 .font(.system(size: 14, weight: .semibold))
                 .frame(width: 20)
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Sigue en el móvil")
                         .font(.system(size: 13, weight: .semibold))
@@ -1081,37 +1280,59 @@ struct PhoneRow: View {
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                        .textMorph()
                 }
-                if let session = model.selectedSession {
+                PhoneTargetPicker()
+                if showClaudeSessionPicker, let session = model.selectedSession {
                     SessionPicker(selected: session)
                 } else {
                     copyCommandButton
                 }
             }
             Spacer(minLength: 0)
-            if let session = model.selectedSession, let qr = QR.image(for: session.url) {
+            if let qr = QR.image(for: qrURL) {
                 Image(decorative: qr, scale: 1)
                     .interpolation(.none)
                     .resizable()
                     .frame(width: 58, height: 58)
                     .padding(5)
                     .background(.white, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                    .id(session.id) // al cambiar de chat, el QR se funde con el nuevo
+                    .id(qrURL)
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
-                    .help(session.url)
-                    .accessibilityLabel("Código QR para abrir «\(session.name)» en el móvil")
+                    .help(qrURL)
+                    .accessibilityLabel(accessibilityQR)
             }
         }
         .animation(Motion.curve(Motion.standard), value: model.selectedSession?.id)
+        .animation(Motion.curve(Motion.standard), value: model.phoneTarget)
+    }
+
+    private var accessibilityQR: String {
+        switch target {
+        case .claude:
+            if let session = model.selectedSession {
+                return "Código QR para abrir «\(session.name)» en Claude"
+            }
+            return "Código QR para abrir Claude Code en el móvil"
+        case .cursor: return "Código QR para abrir los agentes de Cursor en el móvil"
+        case .codex: return "Código QR para abrir Codex en ChatGPT"
+        }
     }
 
     private var description: String {
-        // La app del móvil a veces abre Claude sin ir al chat (fallo conocido de Remote Control),
-        // así que también decimos dónde encontrarlo a mano.
-        if model.selectedSession != nil { return "Escanéalo. Si solo se abre Claude, toca «Code» y elige este chat:" }
-        return model.openSessionCount > 0
-            ? "Tus chats aún no están conectados al móvil. Actívalo con Remote Control:"
-            : "Abre un chat de Claude Code con Remote Control para verlo aquí:"
+        switch target {
+        case .claude:
+            if model.selectedSession != nil {
+                return "Escanéalo. Si solo se abre Claude, toca «Code» y elige este chat:"
+            }
+            return model.openSessionCount > 0
+                ? "Tus chats aún no están conectados al móvil. Actívalo con Remote Control:"
+                : "Abre un chat de Claude Code con Remote Control para verlo aquí:"
+        case .cursor:
+            return "App de Cursor en el iPhone: empareja este Mac y abre el agente. También puedes usar /remote-control en el Agents Window."
+        case .codex:
+            return "App de ChatGPT → Codex. Empareja el Mac en Ajustes → Connections → Control this Mac, o arranca Remote Control en la terminal."
+        }
     }
 
     private var copyCommandButton: some View {
@@ -1123,7 +1344,9 @@ struct PhoneRow: View {
             }
         } label: {
             HStack(spacing: 5) {
-                Text("/remote-control").font(.system(size: 11, weight: .medium, design: .monospaced))
+                Text(target.copyCommand)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .lineLimit(1)
                 Image(systemName: copied ? "checkmark" : "doc.on.doc")
                     .font(.system(size: 10, weight: .semibold))
                     .symbolSwap()
@@ -1133,7 +1356,41 @@ struct PhoneRow: View {
             .background(Capsule().fill(Color.primary.opacity(0.09)))
         }
         .buttonStyle(PressStyle())
-        .help(copied ? "¡Copiado!" : "Cópialo y escríbelo en un chat de Claude Code en la terminal")
+        .help(copied ? "¡Copiado!" : target.copyHelp)
+    }
+}
+
+/// Claude / Cursor / Codex: el QR e instrucciones cambian con el destino.
+struct PhoneTargetPicker: View {
+    @EnvironmentObject var model: Despierto
+    @Namespace private var selection
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(PhoneTarget.allCases) { target in
+                let selected = model.phoneTarget == target
+                Button {
+                    withAnimation(Motion.slide) { model.phoneTarget = target }
+                } label: {
+                    Text(target.title)
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(maxWidth: .infinity, minHeight: 24)
+                        .foregroundStyle(selected ? Color.primary : Color.secondary)
+                        .background {
+                            if selected {
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(Color.primary.opacity(0.12))
+                                    .matchedGeometryEffect(id: "phone-target", in: selection)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PressStyle())
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.06)))
     }
 }
 
@@ -1305,6 +1562,16 @@ extension View {
 }
 
 enum Format {
+    /// «A», «A y B», «A, B y C».
+    static func joinedList(_ items: [String]) -> String {
+        switch items.count {
+        case 0: return ""
+        case 1: return items[0]
+        case 2: return "\(items[0]) y \(items[1])"
+        default: return items.dropLast().joined(separator: ", ") + " y " + (items.last ?? "")
+        }
+    }
+
     /// `fixedWidth`: rellena con un espacio del ancho de una cifra (9:59 → « 9:59»),
     /// para que el icono de la barra no cambie de ancho al pasar de 10:00 a 9:59.
     static func countdown(_ seconds: TimeInterval, fixedWidth: Bool = false) -> String {
@@ -1371,7 +1638,8 @@ enum Snapshot {
 
         let model = Despierto(preview: true)
         model.battery = Battery(percent: 52, charging: false)
-        model.claudeCodeOpen = true
+        model.openAgents = [.claude, .cursor, .codex]
+        model.phoneTarget = .claude
         model.openSessionCount = 3
         model.needsSetup = args.contains("--needs-setup")
         // `--low-battery`: el aviso de cuando vuelve solo a lo normal por batería baja
