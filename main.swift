@@ -609,7 +609,19 @@ final class Despierto: ObservableObject {
         guard let link = remoteControlURL ?? remoteStopURL else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(link, forType: .string)
-        notice = "Copiado \(link) — en Safari del celular: Favoritos o «Añadir a Inicio». Misma Wi‑Fi."
+        notice = "Copiado. En el iPhone, Safari → despierto.local:8787 (misma Wi‑Fi) → Favoritos."
+    }
+
+    /// AirDrop / Mensajes / Mail: la forma más simple de dejar el enlace en el celular.
+    func shareRemoteStopLink() {
+        guard let link = remoteControlURL ?? remoteStopURL, let url = URL(string: link) else { return }
+        let items: [Any] = [url, "Despierto — abrí este enlace en Safari (misma Wi‑Fi). Cuando termines, tocá «Volver a lo normal»."]
+        let picker = NSSharingServicePicker(items: items)
+        if let anchor = NSApp.windows.first(where: { $0.isVisible && $0 is GlassPanel })?.contentView {
+            picker.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .minY)
+        } else if let airDrop = NSSharingService(named: .sendViaAirDrop) {
+            airDrop.perform(withItems: items)
+        }
     }
 
     private static let setupPrompt = "Despierto necesita tu contraseña una última vez. Después ya no te la volverá a pedir."
@@ -1582,22 +1594,38 @@ struct RemoteStopRow: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .textMorph()
                 if model.isAwake, phoneLink != nil {
-                    Text("http://\(RemoteStopServer.localHost):\(RemoteStopServer.port)/")
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    Text("despierto.local:8787")
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
                         .textSelection(.enabled)
-                    Button { model.copyRemoteStopLink() } label: {
-                        HStack(spacing: 5) {
-                            Text("Copiar despierto.local")
-                                .font(.system(size: 11, weight: .semibold))
-                            Image(systemName: "doc.on.doc")
-                                .font(.system(size: 10, weight: .semibold))
+                    HStack(spacing: 6) {
+                        Button { model.copyRemoteStopLink() } label: {
+                            HStack(spacing: 5) {
+                                Text("Copiar")
+                                    .font(.system(size: 11, weight: .semibold))
+                                Image(systemName: "doc.on.doc")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(Color.primary.opacity(0.09)))
                         }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Capsule().fill(Color.primary.opacity(0.09)))
+                        .buttonStyle(PressStyle())
+                        .help("Copiá el enlace para pegarlo en Safari del iPhone")
+
+                        Button { model.shareRemoteStopLink() } label: {
+                            HStack(spacing: 5) {
+                                Text("AirDrop / Compartir")
+                                    .font(.system(size: 11, weight: .semibold))
+                                Image(systemName: "square.and.arrow.up")
+                                    .font(.system(size: 10, weight: .semibold))
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(Color.primary.opacity(0.09)))
+                        }
+                        .buttonStyle(PressStyle())
+                        .help("Mandá el enlace al iPhone por AirDrop o Mensajes")
                     }
-                    .buttonStyle(PressStyle())
-                    .help("Copiá http://despierto.local:8787/ — funciona en cualquier red Wi‑Fi donde esté activo Despierto")
                 }
             }
             Spacer(minLength: 0)
