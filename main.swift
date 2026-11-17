@@ -468,6 +468,7 @@ final class Despierto: ObservableObject {
     @Published var openSessionCount = 0                  // chats de Claude abiertos en total
     @Published var selectedSessionID: String?
     @Published var phoneTarget: PhoneTarget = .claude
+    @Published var mobilePane: MobilePane = .follow
     @Published var launchAtLogin = false
     @Published var errorMessage: String?
     @Published var notice: String?               // aviso tranquilo (no es un error), p. ej. tras volver solo a lo normal
@@ -559,6 +560,26 @@ final class Despierto: ObservableObject {
         saveDates(start: minutes == nil ? nil : start,
                   end: minutes.map { start.addingTimeInterval(Double($0) * 60) })
         startRemoteStopServer()
+        mobilePane = .stop // el enlace ya se copió: mostrar el QR de apagar
+        Haptics.tap()
+        refresh()
+    }
+
+    /// Suma minutos al temporizador (o arranca uno si estaba sin límite). Usado desde el móvil.
+    func extend(byMinutes minutes: Int) {
+        guard isAwake, minutes > 0 else { return }
+        let now = Date()
+        let baseEnd = endDate.map { max($0, now) } ?? now
+        let newEnd = baseEnd.addingTimeInterval(Double(minutes) * 60)
+        let newStart = startDate ?? now
+        cancelTimer()
+        saveDates(start: newStart, end: newEnd)
+        let remainingMins = max(1, Int(ceil(newEnd.timeIntervalSince(now) / 60)))
+        if System.passwordless {
+            startTimer(minutes: remainingMins)
+        }
+        publishPhoneStatus()
+        notice = "Desde el móvil: +\(minutes) min · quedan \(Format.countdown(newEnd.timeIntervalSince(now)))"
         Haptics.tap()
         refresh()
     }
@@ -566,6 +587,7 @@ final class Despierto: ObservableObject {
     func stop() {
         cancelTimer()
         stopRemoteStopServer()
+        mobilePane = .follow
         if !System.sudoPmset(0) {
             guard runAsAdmin(Self.setupScript(value: 0, rootTimerMinutes: nil), prompt: Self.setupPrompt) else { return }
             checkSetup()
@@ -586,17 +608,34 @@ final class Despierto: ObservableObject {
             UserDefaults.standard.set(fresh, forKey: "remoteStopToken")
             return fresh
         }()
-        remoteStop.start(token: token) { [weak self] in
-            Task { @MainActor in self?.stop() }
-        }
+        remoteStop.start(
+            token: token,
+            onStop: { [weak self] in Task { @MainActor in self?.stop() } },
+            onExtend: { [weak self] minutes in Task { @MainActor in self?.extend(byMinutes: minutes) } }
+        )
         remoteStopURL = remoteStop.stopURL
         remoteControlURL = remoteStop.controlURL
+        publishPhoneStatus()
         // Copia el dominio local (Universal Clipboard → iPhone).
         if let link = remoteControlURL {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(link, forType: .string)
-            notice = "Enlace copiado: \(RemoteStopServer.localHost). Abrilo en el celular antes de cerrar la tapa; después apagás sin abrir el Mac."
+            notice = "Copiado · abrilo en el celular antes de cerrar"
         }
+    }
+
+    /// Estado que ve la web del móvil (tiempo, agentes).
+    private func publishPhoneStatus() {
+        let agents = openAgents.isEmpty && isAwake ? System.detectAgents() : openAgents
+        remoteStop.updateStatus(PhoneDashboard(
+            awake: isAwake,
+            remainingSeconds: endDate.map { max(0, Int($0.timeIntervalSince(now))) },
+            unlimited: isAwake && endDate == nil,
+            claude: agents.contains(.claude),
+            cursor: agents.contains(.cursor),
+            codex: agents.contains(.codex),
+            antigravity: agents.contains(.antigravity)
+        ))
     }
 
     private func stopRemoteStopServer() {
@@ -609,7 +648,7 @@ final class Despierto: ObservableObject {
         guard let link = remoteControlURL ?? remoteStopURL else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(link, forType: .string)
-        notice = "Copiado. En el iPhone, Safari → despierto.local:8787 (misma Wi‑Fi) → Favoritos."
+        notice = "Copiado · Safari → \(RemoteStopServer.localHost)"
     }
 
     /// AirDrop / Mensajes / Mail: la forma más simple de dejar el enlace en el celular.
@@ -790,6 +829,7 @@ final class Despierto: ObservableObject {
         if isAwake {
             remoteStopURL = remoteStop.stopURL ?? remoteStopURL
             remoteControlURL = remoteStop.controlURL ?? remoteControlURL
+            publishPhoneStatus()
         }
 
         // Si ya no está despierto, o el temporizador se perdió (p. ej. al reiniciar), lo olvidamos.
@@ -802,6 +842,7 @@ final class Despierto: ObservableObject {
         ticks += 1
         // Brillo/tapa cada segundo si hay algo que hacer (incl. recuperación tras crash).
         if isAwake || dimmedForLid || savedBrightness != nil { syncLidBrightness() }
+        if isAwake { publishPhoneStatus() }
         let timerJustEnded = endDate.map { $0 <= now } ?? false
         if ticks % 5 == 0 || timerJustEnded { refresh() }
     }
@@ -1043,27 +1084,65 @@ enum System {
 
 // MARK: - Apagado remoto (misma Wi‑Fi)
 
-/// HTTP mínimo en la LAN + Bonjour (`despierto.local`) para apagar desde el móvil.
+/// Snapshot para la web del móvil (se actualiza desde el hilo principal).
+struct PhoneDashboard: Sendable {
+    var awake = false
+    var remainingSeconds: Int? = nil
+    var unlimited = false
+    var claude = false
+    var cursor = false
+    var codex = false
+    var antigravity = false
+
+    var json: String {
+        let rem = remainingSeconds.map(String.init) ?? "null"
+        return """
+        {"awake":\(awake),"remainingSeconds":\(rem),"unlimited":\(unlimited),\
+        "claude":\(claude),"cursor":\(cursor),"codex":\(codex),"antigravity":\(antigravity)}
+        """
+    }
+}
+
+/// HTTP + Bonjour (`despierto.local`) con panel móvil: tiempo, agentes, extender, apagar.
 final class RemoteStopServer: @unchecked Sendable {
     static let port: UInt16 = 8787
     /// Dominio mDNS fijo en la red local (misma Wi‑Fi).
     static let localHost = "despierto.local"
+    /// Puerto como texto fijo (evitar que SwiftUI formatee 8787 → «8.787»).
+    static let portText = "8787"
+    static var hostPort: String { "\(localHost):\(portText)" }
 
     private(set) var stopURL: String?
     /// Página con botón (para bookmark / pestaña abierta). No apaga al abrirla.
     private(set) var controlURL: String?
     private var token = ""
     private var onStop: (() -> Void)?
+    private var onExtend: ((Int) -> Void)?
     private var serverFD: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     /// `dns-sd -P` publica despierto.local → IP actual.
     private var bonjourProcess: Process?
+    private let statusLock = NSLock()
+    private var dashboard = PhoneDashboard()
+
+    func updateStatus(_ status: PhoneDashboard) {
+        statusLock.lock()
+        dashboard = status
+        statusLock.unlock()
+    }
+
+    private func currentStatus() -> PhoneDashboard {
+        statusLock.lock()
+        defer { statusLock.unlock() }
+        return dashboard
+    }
 
     @MainActor
-    func start(token: String, onStop: @escaping () -> Void) {
+    func start(token: String, onStop: @escaping () -> Void, onExtend: @escaping (Int) -> Void) {
         stop()
         self.token = token
         self.onStop = onStop
+        self.onExtend = onExtend
         guard let ip = System.lanIPv4() else {
             stopURL = nil
             controlURL = nil
@@ -1100,9 +1179,8 @@ final class RemoteStopServer: @unchecked Sendable {
         source.resume()
         acceptSource = source
 
-        // Dominio memorable; la IP sigue resolviendo si .local falla en alguna red.
-        controlURL = "http://\(Self.localHost):\(Self.port)/"
-        stopURL = "http://\(Self.localHost):\(Self.port)/stop?t=\(token)"
+        controlURL = "http://\(Self.localHost):\(Self.portText)/"
+        stopURL = "http://\(Self.localHost):\(Self.portText)/stop?t=\(token)"
         startBonjour(ip: ip)
     }
 
@@ -1111,24 +1189,20 @@ final class RemoteStopServer: @unchecked Sendable {
         stopBonjour()
         acceptSource?.cancel()
         acceptSource = nil
-        if serverFD >= 0 {
-            // El cancelHandler cierra el fd; evitamos doble close.
-            serverFD = -1
-        }
+        if serverFD >= 0 { serverFD = -1 }
         stopURL = nil
         controlURL = nil
         onStop = nil
+        onExtend = nil
     }
 
-    /// Publica `despierto.local` en la LAN (Bonjour / mDNS) apuntando a esta IP.
     private func startBonjour(ip: String) {
         stopBonjour()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
-        // -P: servicio + hostname.local + dirección A
         process.arguments = [
             "-P", "Despierto", "_http._tcp", "local.",
-            "\(Self.port)", "\(Self.localHost).", ip,
+            Self.portText, "\(Self.localHost).", ip,
         ]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
@@ -1145,7 +1219,6 @@ final class RemoteStopServer: @unchecked Sendable {
         guard let process = bonjourProcess else { return }
         bonjourProcess = nil
         process.terminate()
-        // Por si quedó colgado tras TERM
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) {
             if process.isRunning { process.interrupt() }
         }
@@ -1165,6 +1238,19 @@ final class RemoteStopServer: @unchecked Sendable {
         }
     }
 
+    private func queryValue(_ name: String, in pathAndQuery: String) -> String? {
+        guard let q = pathAndQuery.split(separator: "?", maxSplits: 1).dropFirst().first else { return nil }
+        for part in q.split(separator: "&") {
+            let kv = part.split(separator: "=", maxSplits: 1)
+            if kv.count == 2, kv[0] == name { return String(kv[1]) }
+        }
+        return nil
+    }
+
+    private func authorized(_ path: String, request: String) -> Bool {
+        queryValue("t", in: path) == token || request.contains("t=\(token)")
+    }
+
     private func serve(_ client: Int32) {
         defer { Darwin.close(client) }
         var buffer = [UInt8](repeating: 0, count: 8192)
@@ -1173,52 +1259,166 @@ final class RemoteStopServer: @unchecked Sendable {
         let request = String(decoding: buffer.prefix(n), as: UTF8.self)
         let firstLine = request.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? ""
         let path = firstLine.split(separator: " ").dropFirst().first.map(String.init) ?? ""
-        let isStop = path.hasPrefix("/stop") && (path.contains("t=\(token)") || request.contains("t=\(token)"))
-        let isHome = path == "/" || path.hasPrefix("/?") || path.hasPrefix("/index")
+        let pathOnly = String(path.split(separator: "?", maxSplits: 1).first ?? Substring(path))
 
-        let status: String
+        let httpStatus: String
+        let contentType: String
         let body: String
-        if isStop {
-            status = "200 OK"
-            body = """
-            <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-            <title>Despierto</title>
-            <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
-            <div style="text-align:center;padding:24px"><h1 style="font-size:22px;margin:0 0 8px">Listo</h1>
-            <p style="opacity:.7;margin:0">Despierto volvió a lo normal. El Mac ya puede dormirse.</p></div></body>
-            """
+
+        if pathOnly == "/api/status", authorized(path, request: request) {
+            httpStatus = "200 OK"
+            contentType = "application/json; charset=utf-8"
+            body = currentStatus().json
+        } else if pathOnly == "/api/extend", authorized(path, request: request) {
+            let minutes = Int(queryValue("minutes", in: path) ?? "") ?? 15
+            let extend = onExtend
+            DispatchQueue.main.async { extend?(max(1, min(minutes, 240))) }
+            httpStatus = "200 OK"
+            contentType = "application/json; charset=utf-8"
+            body = "{\"ok\":true,\"minutes\":\(max(1, min(minutes, 240)))}"
+        } else if pathOnly == "/stop", authorized(path, request: request) {
+            httpStatus = "200 OK"
+            contentType = "text/html; charset=utf-8"
+            body = Self.doneHTML
             let callback = onStop
             DispatchQueue.main.async { callback?() }
-        } else if isHome {
-            status = "200 OK"
-            let link = stopURL ?? "/stop?t=\(token)"
-            body = """
-            <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-            <title>Despierto</title>
-            <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
-            <div style="text-align:center;padding:24px;max-width:320px">
-            <h1 style="font-size:22px;margin:0 0 12px">Despierto</h1>
-            <p style="opacity:.7;margin:0 0 8px">despierto.local · misma Wi‑Fi</p>
-            <p style="opacity:.7;margin:0 0 20px">Favoritos o «Añadir a Inicio». Cuando termines, tocá el botón — sin abrir el Mac.</p>
-            <a href="\(link)" style="display:inline-block;background:#ECEAE6;color:#141413;text-decoration:none;font-weight:600;padding:14px 20px;border-radius:12px">Volver a lo normal</a>
-            </div></body>
-            """
+        } else if pathOnly == "/" || pathOnly == "/index" || pathOnly.isEmpty {
+            httpStatus = "200 OK"
+            contentType = "text/html; charset=utf-8"
+            body = Self.dashboardHTML(token: token)
         } else {
-            status = "404 Not Found"
+            httpStatus = "404 Not Found"
+            contentType = "text/plain; charset=utf-8"
             body = "Not found"
         }
 
         let payload = Array("""
-        HTTP/1.1 \(status)\r
-        Content-Type: text/html; charset=utf-8\r
+        HTTP/1.1 \(httpStatus)\r
+        Content-Type: \(contentType)\r
         Content-Length: \(body.utf8.count)\r
+        Cache-Control: no-store\r
         Connection: close\r
+        Access-Control-Allow-Origin: *\r
         \r
         \(body)
         """.utf8)
         _ = payload.withUnsafeBytes { raw in
             send(client, raw.baseAddress, payload.count, 0)
         }
+    }
+
+    private static let doneHTML = """
+    <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+    <title>Despierto</title>
+    <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
+    <div style="text-align:center;padding:24px"><h1 style="font-size:22px;margin:0 0 8px">Listo</h1>
+    <p style="opacity:.7;margin:0">Despierto volvió a lo normal. El Mac ya puede dormirse.</p></div></body>
+    """
+
+    private static func dashboardHTML(token: String) -> String {
+        """
+        <!doctype html>
+        <html lang=es>
+        <meta charset=utf-8>
+        <meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
+        <meta name=apple-mobile-web-app-capable content=yes>
+        <title>Despierto</title>
+        <style>
+          :root { color-scheme: dark; }
+          * { box-sizing: border-box; }
+          body { margin:0; font-family:-apple-system,BlinkMacSystemFont,sans-serif; background:#141413; color:#ECEAE6;
+                 min-height:100vh; padding:28px 20px 40px; }
+          .wrap { max-width:380px; margin:0 auto; }
+          h1 { font-size:22px; font-weight:650; margin:0 0 4px; letter-spacing:-.02em; }
+          .sub { opacity:.55; font-size:13px; margin:0 0 22px; }
+          .time { font-size:48px; font-weight:650; font-variant-numeric:tabular-nums; letter-spacing:-.03em;
+                  margin:8px 0 4px; }
+          .time-label { opacity:.55; font-size:13px; margin-bottom:22px; }
+          .agents { display:grid; gap:8px; margin:0 0 22px; }
+          .agent { display:flex; justify-content:space-between; align-items:center; padding:12px 14px;
+                   border-radius:12px; background:rgba(255,255,255,.06); font-size:14px; }
+          .agent .name { font-weight:600; }
+          .pill { font-size:11px; font-weight:650; padding:4px 8px; border-radius:999px; }
+          .on { background:rgba(110,231,160,.18); color:#6EE7A0; }
+          .off { background:rgba(255,255,255,.08); color:rgba(236,234,230,.45); }
+          .row { display:flex; gap:8px; flex-wrap:wrap; margin:0 0 12px; }
+          button, .btn { appearance:none; border:0; cursor:pointer; font:inherit; font-weight:650; font-size:14px;
+                         padding:14px 16px; border-radius:12px; text-decoration:none; text-align:center;
+                         flex:1 1 30%; min-width:96px; color:#141413; background:#ECEAE6; }
+          button.ghost { background:rgba(255,255,255,.08); color:#ECEAE6; }
+          .stop { width:100%; background:#FBBF57; color:#141413; margin-top:8px; }
+          .err { color:#FBBF57; font-size:13px; min-height:1.2em; margin-top:12px; }
+        </style>
+        <body>
+        <div class=wrap>
+          <h1>Despierto</h1>
+          <p class=sub>despierto.local:8787 · misma Wi‑Fi</p>
+          <div class=time id=time>—</div>
+          <div class=time-label id=timeLabel>Cargando…</div>
+          <div class=agents>
+            <div class=agent><span class=name>Claude Code</span><span class="pill off" id=claude>…</span></div>
+            <div class=agent><span class=name>Cursor</span><span class="pill off" id=cursor>…</span></div>
+            <div class=agent><span class=name>Codex</span><span class="pill off" id=codex>…</span></div>
+            <div class=agent><span class=name>Antigravity</span><span class="pill off" id=agy>…</span></div>
+          </div>
+          <div class=row>
+            <button type=button onclick="extend(15)">+15 min</button>
+            <button type=button onclick="extend(30)">+30 min</button>
+            <button type=button onclick="extend(60)">+1 h</button>
+          </div>
+          <a class="btn stop" href="/stop?t=\(token)">Volver a lo normal</a>
+          <p class=err id=err></p>
+        </div>
+        <script>
+        const T = "\(token)";
+        function fmt(sec) {
+          sec = Math.max(0, sec|0);
+          const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+          if (h > 0) return h + ":" + String(m).padStart(2,"0") + ":" + String(s).padStart(2,"0");
+          return m + ":" + String(s).padStart(2,"0");
+        }
+        function setAgent(id, on) {
+          const el = document.getElementById(id);
+          el.textContent = on ? "Ejecutando" : "No";
+          el.className = "pill " + (on ? "on" : "off");
+        }
+        async function refresh() {
+          try {
+            const r = await fetch("/api/status?t=" + T, { cache: "no-store" });
+            const d = await r.json();
+            if (!d.awake) {
+              document.getElementById("time").textContent = "—";
+              document.getElementById("timeLabel").textContent = "Despierto no está activo";
+            } else if (d.unlimited) {
+              document.getElementById("time").textContent = "∞";
+              document.getElementById("timeLabel").textContent = "Sin límite · podés extender o apagar";
+            } else {
+              document.getElementById("time").textContent = fmt(d.remainingSeconds);
+              document.getElementById("timeLabel").textContent = "Tiempo restante";
+            }
+            setAgent("claude", d.claude);
+            setAgent("cursor", d.cursor);
+            setAgent("codex", d.codex);
+            setAgent("agy", d.antigravity);
+            document.getElementById("err").textContent = "";
+          } catch (e) {
+            document.getElementById("err").textContent = "Sin conexión con el Mac (¿misma Wi‑Fi?)";
+          }
+        }
+        async function extend(minutes) {
+          try {
+            await fetch("/api/extend?t=" + T + "&minutes=" + minutes, { cache: "no-store" });
+            setTimeout(refresh, 400);
+          } catch (e) {
+            document.getElementById("err").textContent = "No se pudo extender";
+          }
+        }
+        refresh();
+        setInterval(refresh, 2000);
+        </script>
+        </body>
+        </html>
+        """
     }
 }
 
@@ -1262,34 +1462,33 @@ struct PanelView: View {
                     .padding(.top, 10)
                     .transition(.asymmetric(insertion: .opacity.combined(with: .offset(y: -4)), removal: .opacity))
             }
-            Hairline().padding(.vertical, 16)
-            VStack(alignment: .leading, spacing: 16) {
+            Hairline().padding(.vertical, 14)
+            VStack(alignment: .leading, spacing: 14) {
                 if model.agentsOpen {
                     AgentsRow().transition(.opacity)
                 }
-                // Siempre visible: si aún no está activo, indica que hay que elegir un tiempo.
-                RemoteStopRow().transition(.opacity)
-                PhoneRow()
+                // Un bloque, un QR: apagar o seguir desde el móvil.
+                MobileSection().transition(.opacity)
             }
             if let error = model.errorMessage {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 12)
+                    .padding(.top, 10)
                     .transition(.opacity)
             }
             if let notice = model.notice {
                 HStack(alignment: .firstTextBaseline, spacing: 7) {
-                    Image(systemName: "battery.25percent")
+                    Image(systemName: noticeIcon(for: notice))
                     Text(notice).fixedSize(horizontal: false, vertical: true)
                 }
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
-                .padding(.top, 12)
+                .padding(.top, 10)
                 .transition(.opacity)
             }
-            Hairline().padding(.top, 16).padding(.bottom, 12)
+            Hairline().padding(.top, 14).padding(.bottom, 12)
             Footer()
         }
         .padding(18)
@@ -1297,8 +1496,13 @@ struct PanelView: View {
         .animation(Motion.curve(Motion.standard), value: model.isAwake)
         .animation(Motion.curve(Motion.standard), value: model.openAgents)
         .animation(Motion.curve(Motion.standard), value: model.phoneTarget)
+        .animation(Motion.curve(Motion.standard), value: model.mobilePane)
         .animation(Motion.curve(Motion.standard), value: model.errorMessage)
         .animation(Motion.curve(Motion.standard), value: model.notice)
+    }
+
+    private func noticeIcon(for notice: String) -> String {
+        notice.hasPrefix("Copiado") || notice.hasPrefix("Enlace") ? "link" : "battery.25percent"
     }
 }
 
@@ -1539,7 +1743,7 @@ struct AgentsRow: View {
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .center, spacing: 12) {
             Image(systemName: model.isAwake ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(model.isAwake ? Semantic.ok(scheme) : Semantic.warn(scheme))
@@ -1551,100 +1755,157 @@ struct AgentsRow: View {
                      : "\(model.openAgentsLabel) están abiertos")
                     .font(.system(size: 13, weight: .semibold))
                     .textMorph()
-                Text(model.isAwake
-                     ? "Seguirán trabajando aunque cierres la tapa"
-                     : "Si cierras la tapa ahora, se pararán")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textMorph()
+                // Con Despierto activo el encabezado ya dice lo de la tapa; solo avisamos si aún no.
+                if !model.isAwake {
+                    Text("Si cierras la tapa ahora, se pararán")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textMorph()
+                }
             }
             Spacer(minLength: 0)
         }
     }
 }
 
+/// Apagar o seguir desde el móvil: un solo bloque, un solo QR.
+enum MobilePane: String, CaseIterable, Identifiable {
+    case stop, follow
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .stop: return "Apagar"
+        case .follow: return "Seguir"
+        }
+    }
+}
+
+struct MobileSection: View {
+    @EnvironmentObject var model: Despierto
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if model.isAwake {
+                HStack(spacing: 10) {
+                    Text("Desde el móvil")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer(minLength: 0)
+                    MobilePanePicker()
+                        .frame(width: 148)
+                }
+                Group {
+                    if model.mobilePane == .stop {
+                        RemoteStopContent()
+                    } else {
+                        PhoneContent(showTitle: false)
+                    }
+                }
+                .id(model.mobilePane)
+                .transition(.opacity)
+            } else {
+                PhoneContent(showTitle: true)
+            }
+        }
+        .animation(Motion.curve(Motion.standard), value: model.mobilePane)
+        .animation(Motion.curve(Motion.standard), value: model.isAwake)
+    }
+}
+
+struct MobilePanePicker: View {
+    @EnvironmentObject var model: Despierto
+    @Namespace private var selection
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(MobilePane.allCases) { option in
+                let selected = model.mobilePane == option
+                Button {
+                    withAnimation(Motion.slide) { model.mobilePane = option }
+                } label: {
+                    Text(option.title)
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(maxWidth: .infinity, minHeight: 24)
+                        .foregroundStyle(selected ? Color.primary : Color.secondary)
+                        .background {
+                            if selected {
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(Color.primary.opacity(0.12))
+                                    .matchedGeometryEffect(id: "mobile-pane", in: selection)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PressStyle())
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.06)))
+    }
+}
+
 /// Enlace/QR para apagar después con el Mac cerrado (misma Wi‑Fi).
-struct RemoteStopRow: View {
+struct RemoteStopContent: View {
     @EnvironmentObject var model: Despierto
 
     private var phoneLink: String? { model.remoteControlURL ?? model.remoteStopURL }
 
     private var subtitle: String {
-        if !model.isAwake {
-            return "Activá un tiempo arriba. En el celular usá http://\(RemoteStopServer.localHost):\(RemoteStopServer.port)/ (misma Wi‑Fi)."
-        }
         if phoneLink == nil {
-            return "Conectá el Mac a la misma Wi‑Fi que el celular para publicar \(RemoteStopServer.localHost)."
+            return "Conectá el Mac a la misma Wi‑Fi que el celular."
         }
-        return "Dominio local: \(RemoteStopServer.localHost). Abrilo en Safari del celular (o el QR), guardalo, y cuando termines tocá «Volver a lo normal» — sin abrir el Mac."
+        return "Misma Wi‑Fi. Escaneá o copiá antes de cerrar."
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: model.isAwake && phoneLink != nil ? "power.circle.fill" : "power.circle")
-                .font(.system(size: 14, weight: .semibold))
-                .frame(width: 20)
             VStack(alignment: .leading, spacing: 6) {
-                Text("Apagar desde el móvil")
-                    .font(.system(size: 13, weight: .semibold))
                 Text(subtitle)
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .textMorph()
-                if model.isAwake, phoneLink != nil {
-                    Text("despierto.local:8787")
+                if phoneLink != nil {
+                    // verbatim: evita que el locale pinte 8787 como «8.787»
+                    Text(verbatim: RemoteStopServer.hostPort)
                         .font(.system(size: 12, weight: .semibold, design: .monospaced))
                         .textSelection(.enabled)
                     HStack(spacing: 6) {
                         Button { model.copyRemoteStopLink() } label: {
-                            HStack(spacing: 5) {
-                                Text("Copiar")
-                                    .font(.system(size: 11, weight: .semibold))
-                                Image(systemName: "doc.on.doc")
-                                    .font(.system(size: 10, weight: .semibold))
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Capsule().fill(Color.primary.opacity(0.09)))
+                            Label("Copiar", systemImage: "doc.on.doc")
+                                .font(.system(size: 11, weight: .semibold))
+                                .labelStyle(.titleAndIcon)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Capsule().fill(Color.primary.opacity(0.09)))
                         }
                         .buttonStyle(PressStyle())
                         .help("Copiá el enlace para pegarlo en Safari del iPhone")
 
                         Button { model.shareRemoteStopLink() } label: {
-                            HStack(spacing: 5) {
-                                Text("AirDrop / Compartir")
-                                    .font(.system(size: 11, weight: .semibold))
-                                Image(systemName: "square.and.arrow.up")
-                                    .font(.system(size: 10, weight: .semibold))
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Capsule().fill(Color.primary.opacity(0.09)))
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.system(size: 11, weight: .semibold))
+                                .frame(width: 26, height: 22)
+                                .background(Capsule().fill(Color.primary.opacity(0.09)))
                         }
                         .buttonStyle(PressStyle())
                         .help("Mandá el enlace al iPhone por AirDrop o Mensajes")
+                        .accessibilityLabel("Compartir")
                     }
                 }
             }
             Spacer(minLength: 0)
-            if model.isAwake, let url = phoneLink, let qr = QR.image(for: url) {
-                Image(decorative: qr, scale: 1)
-                    .interpolation(.none)
-                    .resizable()
-                    .frame(width: 58, height: 58)
-                    .padding(5)
-                    .background(.white, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                    .help(url)
-                    .accessibilityLabel("Código QR: abrí esta página en el móvil antes de cerrar la tapa")
+            if let url = phoneLink, let qr = QR.image(for: url) {
+                QRBadge(image: qr, help: url, accessibilityLabel: "Código QR: abrí esta página en el móvil antes de cerrar la tapa")
             }
         }
     }
 }
 
-struct PhoneRow: View {
+struct PhoneContent: View {
     @EnvironmentObject var model: Despierto
+    var showTitle: Bool = true
 
     private var target: PhoneTarget { model.phoneTarget }
 
@@ -1659,13 +1920,12 @@ struct PhoneRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "iphone")
-                .font(.system(size: 14, weight: .semibold))
-                .frame(width: 20)
             VStack(alignment: .leading, spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Sigue en el móvil")
-                        .font(.system(size: 13, weight: .semibold))
+                    if showTitle {
+                        Text("Sigue en el móvil")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
                     Text(description)
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
@@ -1680,16 +1940,9 @@ struct PhoneRow: View {
             }
             Spacer(minLength: 0)
             if let qr = QR.image(for: qrURL) {
-                Image(decorative: qr, scale: 1)
-                    .interpolation(.none)
-                    .resizable()
-                    .frame(width: 58, height: 58)
-                    .padding(5)
-                    .background(.white, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                QRBadge(image: qr, help: qrURL, accessibilityLabel: accessibilityQR)
                     .id(qrURL)
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
-                    .help(qrURL)
-                    .accessibilityLabel(accessibilityQR)
             }
         }
         .animation(Motion.curve(Motion.standard), value: model.selectedSession?.id)
@@ -1712,15 +1965,15 @@ struct PhoneRow: View {
         switch target {
         case .claude:
             if model.selectedSession != nil {
-                return "Escanéalo. Si solo se abre Claude, toca «Code» y elige este chat:"
+                return "Escaneá el QR o activá Remote Control:"
             }
             return model.openSessionCount > 0
-                ? "Tus chats aún no están conectados al móvil. Actívalo con Remote Control:"
-                : "Abre un chat de Claude Code con Remote Control para verlo aquí:"
+                ? "Conectá el chat con Remote Control:"
+                : "Abrí Claude Code con Remote Control:"
         case .cursor:
-            return "App de Cursor en el iPhone: empareja este Mac y abre el agente. También puedes usar /remote-control en el Agents Window."
+            return "App Cursor en el iPhone, o /remote-control:"
         case .codex:
-            return "App de ChatGPT → Codex. Empareja el Mac en Ajustes → Connections → Control this Mac, o arranca Remote Control en la terminal."
+            return "App ChatGPT → Codex, o el comando:"
         }
     }
 
@@ -1741,6 +1994,23 @@ struct PhoneRow: View {
         }
         .buttonStyle(PressStyle())
         .help(target.copyHelp)
+    }
+}
+
+struct QRBadge: View {
+    let image: CGImage
+    let help: String
+    let accessibilityLabel: String
+
+    var body: some View {
+        Image(decorative: image, scale: 1)
+            .interpolation(.none)
+            .resizable()
+            .frame(width: 58, height: 58)
+            .padding(5)
+            .background(.white, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .help(help)
+            .accessibilityLabel(accessibilityLabel)
     }
 }
 
@@ -2050,8 +2320,11 @@ enum Snapshot {
         switch state {
         case "normal":
             model.isAwake = false
+            model.mobilePane = .follow
         case "awake":
             model.isAwake = true
+            model.mobilePane = .stop
+            model.remoteControlURL = "http://\(RemoteStopServer.localHost):\(RemoteStopServer.portText)/"
         default:
             // `--remaining 1800 --total 1800`: cuánto queda y cuánto duraba (para el GIF)
             func number(_ flag: String) -> Double? {
@@ -2060,6 +2333,8 @@ enum Snapshot {
             let remaining = number("--remaining") ?? (18 * 60 + 24)
             let total = number("--total") ?? (30 * 60)
             model.isAwake = true
+            model.mobilePane = .stop
+            model.remoteControlURL = "http://\(RemoteStopServer.localHost):\(RemoteStopServer.portText)/"
             model.startDate = model.now.addingTimeInterval(remaining - total)
             model.endDate = model.now.addingTimeInterval(remaining)
         }

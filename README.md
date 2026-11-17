@@ -114,16 +114,14 @@ En la Wi‑Fi local Despierto publica el dominio Bonjour:
 
 **[http://despierto.local:8787/](http://despierto.local:8787/)**
 
-1. Activá Despierto. En el celular (misma Wi‑Fi) abrí esa URL:
-   - **AirDrop / Compartir** desde el panel, o
-   - **Copiar** y pegar en Safari, o
-   - escribir `despierto.local:8787`, o
-   - escanear el QR.
-2. En Safari: Favoritos o «Añadir a Inicio».
-3. Cerrá la tapa y seguí con Claude / Cursor / Codex desde el móvil.
-4. Al terminar, abrí esa página y tocá **Volver a lo normal**.
+En el celular ves el **tiempo restante**, si **Claude / Cursor / Codex / Antigravity** están ejecutándose, podés **extender** (+15 / +30 / +1 h) y **volver a lo normal**.
 
-Es **http** (no https): en la red local Safari lo abre igual; un https propio pediría instalar un certificado en el iPhone. Solo funciona en la misma Wi‑Fi y mientras Despierto esté activo.
+1. Activá Despierto. Abrí la URL (AirDrop, Copiar, `despierto.local:8787` o QR).
+2. Favoritos / «Añadir a Inicio».
+3. Cerrá la tapa y seguí trabajando desde el móvil.
+4. Cuando termines, extendé o apagá desde esa página.
+
+Es **http** en la LAN (misma Wi‑Fi). Solo mientras Despierto esté activo.
 
 ## Cómo funciona
 
