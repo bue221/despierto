@@ -16,7 +16,6 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import IOKit
 import CoreGraphics
-import Network
 import Darwin
 
 // DisplayServices: API privada del brillo del panel integrado (sin IOKit.graphics).
@@ -1011,16 +1010,17 @@ enum System {
 
 // MARK: - Apagado remoto (misma Wi‑Fi)
 
-/// HTTP mínimo en la LAN: `GET /stop?t=TOKEN` vuelve Despierto a lo normal.
-@MainActor
-final class RemoteStopServer {
+/// HTTP mínimo en la LAN con sockets BSD: `GET /stop?t=TOKEN` vuelve a lo normal.
+final class RemoteStopServer: @unchecked Sendable {
     static let port: UInt16 = 8787
 
     private(set) var stopURL: String?
-    private var listener: NWListener?
     private var token = ""
     private var onStop: (() -> Void)?
+    private var serverFD: Int32 = -1
+    private var acceptSource: DispatchSourceRead?
 
+    @MainActor
     func start(token: String, onStop: @escaping () -> Void) {
         stop()
         self.token = token
@@ -1029,85 +1029,115 @@ final class RemoteStopServer {
             stopURL = nil
             return
         }
-        do {
-            let parameters = NWParameters.tcp
-            parameters.allowLocalEndpointReuse = true
-            let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: Self.port)!)
-            listener.newConnectionHandler = { [weak self] connection in
-                Task { @MainActor in self?.handle(connection) }
+
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { stopURL = nil; return }
+        var reuse: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout.size(ofValue: reuse)))
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = Self.port.bigEndian
+        addr.sin_addr = in_addr(s_addr: INADDR_ANY.bigEndian)
+
+        let bindOK: Bool = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
             }
-            listener.stateUpdateHandler = { [weak self] state in
-                Task { @MainActor in
-                    if case .failed = state { self?.stopURL = nil }
-                }
-            }
-            listener.start(queue: .global(qos: .utility))
-            self.listener = listener
-            stopURL = "http://\(ip):\(Self.port)/stop?t=\(token)"
-        } catch {
-            stopURL = nil
-            listener = nil
         }
+        guard bindOK, listen(fd, 4) == 0 else {
+            Darwin.close(fd)
+            stopURL = nil
+            return
+        }
+
+        serverFD = fd
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .global(qos: .utility))
+        source.setEventHandler { [weak self] in self?.acceptClient() }
+        source.setCancelHandler { Darwin.close(fd) }
+        source.resume()
+        acceptSource = source
+        stopURL = "http://\(ip):\(Self.port)/stop?t=\(token)"
     }
 
+    @MainActor
     func stop() {
-        listener?.cancel()
-        listener = nil
+        acceptSource?.cancel()
+        acceptSource = nil
+        if serverFD >= 0 {
+            // El cancelHandler cierra el fd; evitamos doble close.
+            serverFD = -1
+        }
         stopURL = nil
         onStop = nil
     }
 
-    private func handle(_ connection: NWConnection) {
-        connection.start(queue: .global(qos: .utility))
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 8_192) { [weak self] data, _, _, _ in
-            Task { @MainActor in
-                guard let self else {
-                    connection.cancel()
-                    return
-                }
-                let request = String(decoding: data ?? Data(), as: UTF8.self)
-                let isStop = request.contains("/stop") && request.contains("t=\(self.token)")
-                let body: String
-                let status: String
-                if isStop {
-                    status = "200 OK"
-                    body = """
-                    <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-                    <title>Despierto</title>
-                    <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
-                    <div style="text-align:center;padding:24px"><h1 style="font-size:22px;margin:0 0 8px">Listo</h1>
-                    <p style="opacity:.7;margin:0">Despierto volvió a lo normal.</p></div></body>
-                    """
-                    self.onStop?()
-                } else if request.contains("GET / ") || request.contains("GET /HTTP") || request.hasPrefix("GET / ") {
-                    status = "200 OK"
-                    let link = self.stopURL ?? "#"
-                    body = """
-                    <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-                    <title>Despierto</title>
-                    <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
-                    <div style="text-align:center;padding:24px">
-                    <h1 style="font-size:22px;margin:0 0 12px">Despierto</h1>
-                    <p style="opacity:.7;margin:0 0 20px">¿Ya terminaste? Apaga el modo despierto.</p>
-                    <a href="\(link)" style="display:inline-block;background:#ECEAE6;color:#141413;text-decoration:none;font-weight:600;padding:12px 18px;border-radius:12px">Volver a lo normal</a>
-                    </div></body>
-                    """
-                } else {
-                    status = "404 Not Found"
-                    body = "Not found"
-                }
-                let payload = Data("""
-                HTTP/1.1 \(status)\r
-                Content-Type: text/html; charset=utf-8\r
-                Content-Length: \(body.utf8.count)\r
-                Connection: close\r
-                \r
-                \(body)
-                """.utf8)
-                connection.send(content: payload, completion: .contentProcessed { _ in
-                    connection.cancel()
-                })
+    private func acceptClient() {
+        var addr = sockaddr_storage()
+        var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        let client: Int32 = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                accept(serverFD, $0, &len)
             }
+        }
+        guard client >= 0 else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.serve(client)
+        }
+    }
+
+    private func serve(_ client: Int32) {
+        defer { Darwin.close(client) }
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        let n = recv(client, &buffer, buffer.count, 0)
+        guard n > 0 else { return }
+        let request = String(decoding: buffer.prefix(n), as: UTF8.self)
+        let firstLine = request.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? ""
+        let isStop = firstLine.contains("/stop") && request.contains("t=\(token)")
+        let isHome = firstLine.hasPrefix("GET / ") || firstLine.hasPrefix("GET /?")
+
+        let status: String
+        let body: String
+        if isStop {
+            status = "200 OK"
+            body = """
+            <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+            <title>Despierto</title>
+            <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
+            <div style="text-align:center;padding:24px"><h1 style="font-size:22px;margin:0 0 8px">Listo</h1>
+            <p style="opacity:.7;margin:0">Despierto volvió a lo normal.</p></div></body>
+            """
+            let callback = onStop
+            DispatchQueue.main.async { callback?() }
+        } else if isHome {
+            status = "200 OK"
+            let link = stopURL ?? "#"
+            body = """
+            <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+            <title>Despierto</title>
+            <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
+            <div style="text-align:center;padding:24px">
+            <h1 style="font-size:22px;margin:0 0 12px">Despierto</h1>
+            <p style="opacity:.7;margin:0 0 20px">¿Ya terminaste? Apaga el modo despierto.</p>
+            <a href="\(link)" style="display:inline-block;background:#ECEAE6;color:#141413;text-decoration:none;font-weight:600;padding:12px 18px;border-radius:12px">Volver a lo normal</a>
+            </div></body>
+            """
+        } else {
+            status = "404 Not Found"
+            body = "Not found"
+        }
+
+        let payload = Array("""
+        HTTP/1.1 \(status)\r
+        Content-Type: text/html; charset=utf-8\r
+        Content-Length: \(body.utf8.count)\r
+        Connection: close\r
+        \r
+        \(body)
+        """.utf8)
+        _ = payload.withUnsafeBytes { raw in
+            send(client, raw.baseAddress, payload.count, 0)
         }
     }
 }
@@ -1239,7 +1269,6 @@ struct BrewIcon: View {
     let awake: Bool
     let brewedAt: Date
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var dip = false
 
     var body: some View {
         ZStack {
@@ -1257,17 +1286,9 @@ struct BrewIcon: View {
             }
             .foregroundStyle(awake ? Ash.c950 : Color.primary)
             .offset(y: awake ? 0 : -4) // sin vapor, la taza se centra
-            .scaleEffect(dip ? 0.84 : 1)
         }
         .frame(width: 40, height: 40)
         .animation(reduceMotion ? Motion.curve(Motion.quick) : Motion.settle, value: awake)
-        .onChange(of: awake) { _ in
-            guard !reduceMotion else { return }
-            withAnimation(Motion.curve(0.09)) { dip = true }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {
-                withAnimation(Motion.settle) { dip = false }
-            }
-        }
         .accessibilityHidden(true)
     }
 }
@@ -1382,7 +1403,6 @@ struct DurationControl: View {
         let namespace: Namespace.ID
         let action: () -> Void
         @Environment(\.colorScheme) private var scheme
-        @State private var hovering = false
 
         var body: some View {
             Button(action: action) {
@@ -1396,21 +1416,16 @@ struct DurationControl: View {
                 .frame(maxWidth: .infinity, minHeight: 28)
                 .foregroundStyle(selected ? (scheme == .dark ? Ash.c950 : .white) : Color.primary)
                 .background {
-                    ZStack {
+                    if selected {
                         RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(Color.primary.opacity(hovering && !selected ? 0.08 : 0))
-                        if selected {
-                            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .fill(Color.primary)
-                                .matchedGeometryEffect(id: "selection", in: namespace)
-                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                        }
+                            .fill(Color.primary)
+                            .matchedGeometryEffect(id: "selection", in: namespace)
+                            .transition(.opacity.combined(with: .scale(scale: 0.9)))
                     }
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(PressStyle())
-            .onHover { inside in withAnimation(Motion.curve(0.1)) { hovering = inside } }
             .help(option.minutes == nil ? "Sin límite, hasta que lo apagues" : "Despierto durante \(option.id)")
             .accessibilityLabel(option.minutes == nil ? "Sin límite" : option.id)
             .accessibilityAddTraits(selected ? .isSelected : [])
@@ -1420,7 +1435,6 @@ struct DurationControl: View {
 
 struct ReturnButton: View {
     @EnvironmentObject var model: Despierto
-    @State private var hovering = false
 
     var body: some View {
         Button { model.stop() } label: {
@@ -1429,7 +1443,7 @@ struct ReturnButton: View {
                 .frame(maxWidth: .infinity, minHeight: 30)
                 .background(
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Color.primary.opacity(hovering ? 0.08 : 0))
+                        .fill(Color.primary.opacity(0.04))
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -1438,7 +1452,6 @@ struct ReturnButton: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(PressStyle())
-        .onHover { inside in withAnimation(Motion.curve(0.1)) { hovering = inside } }
     }
 }
 
@@ -1506,7 +1519,6 @@ struct RemoteStopRow: View {
 
 struct PhoneRow: View {
     @EnvironmentObject var model: Despierto
-    @State private var copied = false
 
     private var target: PhoneTarget { model.phoneTarget }
 
@@ -1589,25 +1601,20 @@ struct PhoneRow: View {
     private var copyCommandButton: some View {
         Button {
             model.copyRemoteControlCommand()
-            withAnimation(Motion.curve(Motion.quick)) { copied = true }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                withAnimation(Motion.curve(Motion.standard)) { copied = false }
-            }
         } label: {
             HStack(spacing: 5) {
                 Text(target.copyCommand)
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .lineLimit(1)
-                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                Image(systemName: "doc.on.doc")
                     .font(.system(size: 10, weight: .semibold))
-                    .symbolSwap()
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(Capsule().fill(Color.primary.opacity(0.09)))
         }
         .buttonStyle(PressStyle())
-        .help(copied ? "¡Copiado!" : target.copyHelp)
+        .help(target.copyHelp)
     }
 }
 
