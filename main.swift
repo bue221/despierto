@@ -325,13 +325,10 @@ enum Glass {
 
     /// Cristal Liquid Glass transparente en macOS 26; cristal clásico en versiones anteriores.
     /// El «humo» que lo oscurece lo pinta SwiftUI (PanelRoot), así se puede animar.
+    /// `NSGlassEffectView` se resuelve en runtime para poder compilar con SDKs anteriores a macOS 26.
     @MainActor
     static func make(content: NSView) -> NSView {
-        if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectView()
-            glass.style = .clear
-            glass.cornerRadius = radius
-            glass.contentView = content
+        if #available(macOS 26.0, *), let glass = makeLiquidGlass(content: content) {
             return glass
         }
         let effect = NSVisualEffectView()
@@ -350,6 +347,17 @@ enum Glass {
             content.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
         ])
         return effect
+    }
+
+    @MainActor
+    private static func makeLiquidGlass(content: NSView) -> NSView? {
+        guard let glassClass = NSClassFromString("NSGlassEffectView") as? NSView.Type else { return nil }
+        let glass = glassClass.init(frame: .zero)
+        // style.clear ≈ 0 en AppKit actual; si el KVC falla, seguimos con el cristal clásico.
+        glass.setValue(0, forKey: "style")
+        glass.setValue(radius, forKey: "cornerRadius")
+        glass.setValue(content, forKey: "contentView")
+        return glass
     }
 }
 
