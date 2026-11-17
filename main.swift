@@ -506,7 +506,9 @@ final class Despierto: ObservableObject {
         startDate = UserDefaults.standard.object(forKey: "startDate") as? Date
         endDate = UserDefaults.standard.object(forKey: "endDate") as? Date
         if UserDefaults.standard.object(forKey: "savedBrightness") != nil {
+            // Tras un crash con tapa cerrada: hay un brillo pendiente de restaurar.
             savedBrightness = Float(UserDefaults.standard.double(forKey: "savedBrightness"))
+            dimmedForLid = true
         }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -652,12 +654,12 @@ final class Despierto: ObservableObject {
 
     /// Con Despierto activo y tapa cerrada: brillo a 0 (ahorro de pantalla/batería, no de RAM).
     /// Al abrir la tapa o volver a lo normal, restaura el brillo anterior.
-    /// Se comprueba en cada `refresh` (cada ~5 s) para no depender de notificaciones del sistema.
+    /// No enciende el backlight mientras la tapa siga cerrada.
     private func syncLidBrightness() {
         lidClosed = System.lidClosed()
         if isAwake && lidClosed {
             dimBrightnessForLid()
-        } else {
+        } else if !lidClosed {
             restoreBrightnessIfNeeded()
         }
     }
@@ -674,10 +676,11 @@ final class Despierto: ObservableObject {
 
     private func restoreBrightnessIfNeeded() {
         guard dimmedForLid || savedBrightness != nil else { return }
+        // Con la tapa cerrada no subimos el brillo (evita encender el panel a ciegas).
+        if System.lidClosed() { return }
         let stored = Float(UserDefaults.standard.double(forKey: "savedBrightness"))
         let level = max(0.01, min(1, savedBrightness ?? (stored > 0 ? stored : 0.5)))
-        // Solo olvidamos el nivel guardado si el sistema aceptó el cambio;
-        // si falla (p. ej. tapa aún cerrada / DisplayServices), reintentamos luego.
+        // Solo olvidamos el nivel guardado si el sistema aceptó el cambio.
         guard System.setDisplayBrightness(level) else { return }
         dimmedForLid = false
         savedBrightness = nil
@@ -734,8 +737,8 @@ final class Despierto: ObservableObject {
     private func tick() {
         now = Date()
         ticks += 1
-        // Con la tapa, reaccionamos al segundo; el resto del sistema cada 5 s.
-        if isAwake || dimmedForLid { syncLidBrightness() }
+        // Brillo/tapa cada segundo si hay algo que hacer (incl. recuperación tras crash).
+        if isAwake || dimmedForLid || savedBrightness != nil { syncLidBrightness() }
         let timerJustEnded = endDate.map { $0 <= now } ?? false
         if ticks % 5 == 0 || timerJustEnded { refresh() }
     }
@@ -829,11 +832,36 @@ enum System {
             })
     }
 
+    /// Claude Code lanzado como `claude`, o vía node/bun/tsx, o con sesión viva en ~/.claude.
+    static func claudeCodeRunning() -> Bool {
+        let names = runningProcessNames()
+        if !CodingAgent.claude.processNames.isDisjoint(with: names) { return true }
+        if claudeSessions().open > 0 { return true }
+        return run("/bin/ps", ["-axo", "args="])
+            .split(separator: "\n")
+            .contains { line in
+                let args = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !args.isEmpty else { return false }
+                let tokens = args.split(whereSeparator: \.isWhitespace).map(String.init)
+                guard let first = tokens.first else { return false }
+                let base = first.split(separator: "/").last.map(String.init) ?? first
+                if base == "claude" { return true }
+                // node / bun / tsx invocando el CLI de Claude Code
+                let runners: Set<String> = ["node", "bun", "tsx", "npm", "npx"]
+                guard runners.contains(base) else { return false }
+                return tokens.dropFirst().contains { token in
+                    let leaf = token.split(separator: "/").last.map(String.init) ?? token
+                    return leaf == "claude" || token.hasSuffix("/claude")
+                }
+            }
+    }
+
     /// Claude Code, Cursor, Codex y Antigravity (`agy`) si están abiertos.
     static func detectAgents() -> [CodingAgent] {
         let names = runningProcessNames()
         return CodingAgent.allCases.filter { agent in
-            !agent.processNames.isDisjoint(with: names)
+            if agent == .claude { return claudeCodeRunning() }
+            return !agent.processNames.isDisjoint(with: names)
         }
     }
 
@@ -850,17 +878,38 @@ enum System {
         return false
     }
 
-    /// Brillo del display principal (0…1). Usa DisplayServices (API privada estable en MacBooks).
-    static func displayBrightness() -> Float? {
-        var value: Float = 0
-        guard DisplayServicesGetBrightness(CGMainDisplayID(), &value) == 0 else { return nil }
-        return value
+    /// Displays integrados del Mac (no monitores externos).
+    static func builtinDisplayIDs() -> [CGDirectDisplayID] {
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &count)
+        guard count > 0 else { return [] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        CGGetActiveDisplayList(count, &ids, &count)
+        return ids.prefix(Int(count)).filter { CGDisplayIsBuiltin($0) != 0 }
     }
 
-    /// Pone el brillo del display principal. Devuelve false si no se pudo.
+    /// Brillo del panel integrado (0…1). Usa DisplayServices.
+    static func displayBrightness() -> Float? {
+        let targets = builtinDisplayIDs()
+        let ids = targets.isEmpty ? [CGMainDisplayID()] : targets
+        for id in ids {
+            var value: Float = 0
+            if DisplayServicesGetBrightness(id, &value) == 0 { return value }
+        }
+        return nil
+    }
+
+    /// Pone el brillo de todos los paneles integrados. Devuelve false si ninguno respondió.
     @discardableResult
     static func setDisplayBrightness(_ value: Float) -> Bool {
-        DisplayServicesSetBrightness(CGMainDisplayID(), max(0, min(1, value))) == 0
+        let clamped = max(0, min(1, value))
+        let targets = builtinDisplayIDs()
+        let ids = targets.isEmpty ? [CGMainDisplayID()] : targets
+        var ok = false
+        for id in ids where DisplayServicesSetBrightness(id, clamped) == 0 {
+            ok = true
+        }
+        return ok
     }
 
     /// Lee los chats abiertos de Claude Code (~/.claude/sessions/<pid>.json).
@@ -1406,47 +1455,52 @@ struct SessionPicker: View {
     @EnvironmentObject var model: Despierto
     let selected: ClaudeSession
 
+    private var chip: some View {
+        HStack(spacing: 5) {
+            Text(selected.name)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .textMorph()
+            if model.phoneSessions.count > 1 {
+                Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .bold))
+            }
+        }
+        .font(.system(size: 11, weight: .semibold))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(Color.primary.opacity(0.09)))
+        .contentShape(Capsule())
+    }
+
     var body: some View {
         let several = model.phoneSessions.count > 1
-        Button { if several { showMenu() } } label: {
-            HStack(spacing: 5) {
-                Text(selected.name)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .textMorph()
-                if several {
-                    Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .bold))
+        Group {
+            if several {
+                // Menu de SwiftUI se ancla al chip (no a NSEvent.mouseLocation global).
+                Menu {
+                    ForEach(model.phoneSessions) { session in
+                        Button {
+                            model.selectedSessionID = session.id
+                        } label: {
+                            if session.id == selected.id {
+                                Label(session.busy ? "\(session.name) · trabajando" : session.name,
+                                      systemImage: "checkmark")
+                            } else {
+                                Text(session.busy ? "\(session.name) · trabajando" : session.name)
+                            }
+                        }
+                    }
+                } label: {
+                    chip
                 }
+                .menuStyle(.borderlessButton)
+                .buttonStyle(PressStyle())
+            } else {
+                chip.help(selected.name)
             }
-            .font(.system(size: 11, weight: .semibold))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Capsule().fill(Color.primary.opacity(0.09)))
-            .contentShape(Capsule())
         }
-        .buttonStyle(PressStyle())
         .help(several ? "Elegir otro chat" : selected.name)
     }
-
-    private func showMenu() {
-        let menu = NSMenu()
-        for session in model.phoneSessions {
-            let action = MenuAction { model.selectedSessionID = session.id }
-            let item = NSMenuItem(title: session.busy ? "\(session.name) · trabajando" : session.name,
-                                  action: #selector(MenuAction.run), keyEquivalent: "")
-            item.target = action
-            item.representedObject = action // lo mantiene vivo mientras exista el menú
-            item.state = session.id == selected.id ? .on : .off
-            menu.addItem(item)
-        }
-        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
-    }
-}
-
-final class MenuAction: NSObject {
-    private let handler: () -> Void
-    init(_ handler: @escaping () -> Void) { self.handler = handler }
-    @objc func run() { handler() }
 }
 
 struct Footer: View {
