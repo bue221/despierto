@@ -16,6 +16,8 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import IOKit
 import CoreGraphics
+import Network
+import Darwin
 
 // DisplayServices: API privada del brillo del panel integrado (sin IOKit.graphics).
 @_silgen_name("DisplayServicesGetBrightness")
@@ -474,7 +476,9 @@ final class Despierto: ObservableObject {
     @Published var authorizing = false           // pidiendo la contraseña
     @Published var needsSetup = false            // aún no se ha dado el permiso de una sola vez
     @Published var lidClosed = false             // tapa cerrada (para apagar brillo)
+    @Published var remoteStopURL: String?        // QR/enlace para apagar desde el móvil (misma Wi‑Fi)
     var onAuthorizationEnd: (() -> Void)?
+    private let remoteStop = RemoteStopServer()
 
     /// El chat elegido para el QR (por defecto, el que está trabajando o el más reciente).
     var selectedSession: ClaudeSession? {
@@ -554,12 +558,14 @@ final class Despierto: ObservableObject {
         let start = Date()
         saveDates(start: minutes == nil ? nil : start,
                   end: minutes.map { start.addingTimeInterval(Double($0) * 60) })
+        startRemoteStopServer()
         Haptics.tap()
         refresh()
     }
 
     func stop() {
         cancelTimer()
+        stopRemoteStopServer()
         if !System.sudoPmset(0) {
             guard runAsAdmin(Self.setupScript(value: 0, rootTimerMinutes: nil), prompt: Self.setupPrompt) else { return }
             checkSetup()
@@ -568,6 +574,27 @@ final class Despierto: ObservableObject {
         restoreBrightnessIfNeeded()
         Haptics.tap()
         refresh()
+    }
+
+    /// Mini servidor en la Wi‑Fi local: el móvil escanea el QR y Despierto vuelve a lo normal.
+    private func startRemoteStopServer() {
+        let token: String = {
+            if let existing = UserDefaults.standard.string(forKey: "remoteStopToken"), !existing.isEmpty {
+                return existing
+            }
+            let fresh = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            UserDefaults.standard.set(fresh, forKey: "remoteStopToken")
+            return fresh
+        }()
+        remoteStop.start(token: token) { [weak self] in
+            Task { @MainActor in self?.stop() }
+        }
+        remoteStopURL = remoteStop.stopURL
+    }
+
+    private func stopRemoteStopServer() {
+        remoteStop.stop()
+        remoteStopURL = nil
     }
 
     private static let setupPrompt = "Despierto necesita tu contraseña una última vez. Después ya no te la volverá a pedir."
@@ -647,6 +674,7 @@ final class Despierto: ObservableObject {
     private func returnToNormal(lowBattery battery: Battery) {
         guard System.sudoPmset(0) else { return }
         cancelTimer()
+        stopRemoteStopServer()
         isAwake = false
         restoreBrightnessIfNeeded()
         notice = Self.lowBatteryNotice(percent: battery.percent, at: Date())
@@ -716,7 +744,11 @@ final class Despierto: ObservableObject {
     func refresh() {
         let wasAwake = isAwake
         isAwake = System.sleepDisabled()
-        if isAwake && !wasAwake { brewedAt = Date() }
+        if isAwake && !wasAwake {
+            brewedAt = Date()
+            startRemoteStopServer()
+        }
+        if !isAwake && wasAwake { stopRemoteStopServer() }
         battery = System.battery()
         if isAwake, let battery, Self.batteryTooLow(battery) { returnToNormal(lowBattery: battery) }
         openAgents = System.detectAgents()
@@ -728,6 +760,7 @@ final class Despierto: ObservableObject {
         launchAtLogin = SMAppService.mainApp.status == .enabled
         needsSetup = !FileManager.default.fileExists(atPath: System.sudoersFile)
         syncLidBrightness()
+        if isAwake { remoteStopURL = remoteStop.stopURL ?? remoteStopURL }
 
         // Si ya no está despierto, o el temporizador se perdió (p. ej. al reiniciar), lo olvidamos.
         let timerLost = endDate.map { $0.timeIntervalSinceNow < -10 } ?? false
@@ -938,6 +971,30 @@ enum System {
         return (open, connected)
     }
 
+    /// IPv4 de la Wi‑Fi/Ethernet activa (para el QR de apagado remoto).
+    static func lanIPv4() -> String? {
+        var address: String?
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        while let iface = ptr {
+            defer { ptr = iface.pointee.ifa_next }
+            guard iface.pointee.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let name = String(cString: iface.pointee.ifa_name)
+            guard name.hasPrefix("en") || name.hasPrefix("bridge") else { continue }
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = getnameinfo(iface.pointee.ifa_addr, socklen_t(iface.pointee.ifa_addr.pointee.sa_len),
+                                     &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+            guard result == 0 else { continue }
+            let ip = String(cString: hostname)
+            if ip.hasPrefix("127.") || ip.hasPrefix("169.254.") { continue }
+            address = ip
+            if name == "en0" { break } // prefer Wi‑Fi
+        }
+        return address
+    }
+
     private static func run(_ path: String, _ args: [String]) -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
@@ -949,6 +1006,109 @@ enum System {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         return String(decoding: data, as: UTF8.self)
+    }
+}
+
+// MARK: - Apagado remoto (misma Wi‑Fi)
+
+/// HTTP mínimo en la LAN: `GET /stop?t=TOKEN` vuelve Despierto a lo normal.
+@MainActor
+final class RemoteStopServer {
+    static let port: UInt16 = 8787
+
+    private(set) var stopURL: String?
+    private var listener: NWListener?
+    private var token = ""
+    private var onStop: (() -> Void)?
+
+    func start(token: String, onStop: @escaping () -> Void) {
+        stop()
+        self.token = token
+        self.onStop = onStop
+        guard let ip = System.lanIPv4() else {
+            stopURL = nil
+            return
+        }
+        do {
+            let parameters = NWParameters.tcp
+            parameters.allowLocalEndpointReuse = true
+            let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: Self.port)!)
+            listener.newConnectionHandler = { [weak self] connection in
+                Task { @MainActor in self?.handle(connection) }
+            }
+            listener.stateUpdateHandler = { [weak self] state in
+                Task { @MainActor in
+                    if case .failed = state { self?.stopURL = nil }
+                }
+            }
+            listener.start(queue: .global(qos: .utility))
+            self.listener = listener
+            stopURL = "http://\(ip):\(Self.port)/stop?t=\(token)"
+        } catch {
+            stopURL = nil
+            listener = nil
+        }
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        stopURL = nil
+        onStop = nil
+    }
+
+    private func handle(_ connection: NWConnection) {
+        connection.start(queue: .global(qos: .utility))
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 8_192) { [weak self] data, _, _, _ in
+            Task { @MainActor in
+                guard let self else {
+                    connection.cancel()
+                    return
+                }
+                let request = String(decoding: data ?? Data(), as: UTF8.self)
+                let isStop = request.contains("/stop") && request.contains("t=\(self.token)")
+                let body: String
+                let status: String
+                if isStop {
+                    status = "200 OK"
+                    body = """
+                    <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+                    <title>Despierto</title>
+                    <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
+                    <div style="text-align:center;padding:24px"><h1 style="font-size:22px;margin:0 0 8px">Listo</h1>
+                    <p style="opacity:.7;margin:0">Despierto volvió a lo normal.</p></div></body>
+                    """
+                    self.onStop?()
+                } else if request.contains("GET / ") || request.contains("GET /HTTP") || request.hasPrefix("GET / ") {
+                    status = "200 OK"
+                    let link = self.stopURL ?? "#"
+                    body = """
+                    <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+                    <title>Despierto</title>
+                    <body style="font-family:-apple-system,sans-serif;background:#141413;color:#ECEAE6;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0">
+                    <div style="text-align:center;padding:24px">
+                    <h1 style="font-size:22px;margin:0 0 12px">Despierto</h1>
+                    <p style="opacity:.7;margin:0 0 20px">¿Ya terminaste? Apaga el modo despierto.</p>
+                    <a href="\(link)" style="display:inline-block;background:#ECEAE6;color:#141413;text-decoration:none;font-weight:600;padding:12px 18px;border-radius:12px">Volver a lo normal</a>
+                    </div></body>
+                    """
+                } else {
+                    status = "404 Not Found"
+                    body = "Not found"
+                }
+                let payload = Data("""
+                HTTP/1.1 \(status)\r
+                Content-Type: text/html; charset=utf-8\r
+                Content-Length: \(body.utf8.count)\r
+                Connection: close\r
+                \r
+                \(body)
+                """.utf8)
+                connection.send(content: payload, completion: .contentProcessed { _ in
+                    connection.cancel()
+                })
+            }
+        }
     }
 }
 
@@ -996,6 +1156,9 @@ struct PanelView: View {
             VStack(alignment: .leading, spacing: 16) {
                 if model.agentsOpen {
                     AgentsRow().transition(.opacity)
+                }
+                if model.isAwake, model.remoteStopURL != nil {
+                    RemoteStopRow().transition(.opacity)
                 }
                 PhoneRow()
             }
@@ -1305,6 +1468,38 @@ struct AgentsRow: View {
                     .textMorph()
             }
             Spacer(minLength: 0)
+        }
+    }
+}
+
+/// QR para apagar Despierto desde el móvil (misma Wi‑Fi, sin internet).
+struct RemoteStopRow: View {
+    @EnvironmentObject var model: Despierto
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "power.circle")
+                .font(.system(size: 14, weight: .semibold))
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Apagar desde el móvil")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("Misma Wi‑Fi. Escanéalo cuando termines y Despierto vuelve a lo normal.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            if let url = model.remoteStopURL, let qr = QR.image(for: url) {
+                Image(decorative: qr, scale: 1)
+                    .interpolation(.none)
+                    .resizable()
+                    .frame(width: 58, height: 58)
+                    .padding(5)
+                    .background(.white, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .help(url)
+                    .accessibilityLabel("Código QR para apagar Despierto desde el móvil")
+            }
         }
     }
 }

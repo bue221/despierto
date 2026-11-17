@@ -31,6 +31,7 @@ Con Despierto eliges cuánto tiempo te vas, cierras la tapa y todo sigue funcion
 - **⏱ Cuenta atrás en la barra de menú**, para que sepas cuánto te queda.
 - **🤖 Vigila tus agentes**: si tienes abierto Claude Code, Cursor, Codex o Antigravity (`agy`) y no has activado Despierto, te avisa de que se pararán si cierras la tapa.
 - **📱 Sigue en el móvil**: elige Claude, Cursor o Codex y escanea el QR (o copia el comando de Remote Control) para continuar desde el teléfono.
+- **⏻ Apagar desde el móvil**: con Despierto activo, un QR en la misma Wi‑Fi vuelve el Mac a lo normal cuando termines (sin abrir el portátil).
 - **🔅 Brillo a 0 con la tapa cerrada**: con Despierto activo, al cerrar la tapa apaga el brillo de la pantalla integrada (ahorro de batería/pantalla; no reduce la RAM). Al abrirla, lo restaura.
 - **🔋 Batería a la vista**, con aviso si vas con poca y sin cargador. Y si baja del **10 %** sin cargador, Despierto vuelve solo a lo normal para que el Mac pueda dormirse y no se apague de golpe.
 - **🪟 Cristal transparente**: claro en modo normal y ahumado en negro ceniza cuando está activado. Funciona en modo claro y oscuro.
@@ -106,6 +107,10 @@ El QR abre [chatgpt.com/codex](https://chatgpt.com/codex). En el móvil usa la a
 
 - En el Mac: app de ChatGPT → *Settings → Connections → Control this Mac* y empareja el teléfono con el QR de ChatGPT.
 - En la terminal: `codex remote-control start` (el panel lo copia). La configuración oficial del móvil arranca desde la app de escritorio de ChatGPT.
+
+### Apagar Despierto desde el móvil
+
+Cuando el modo despierto está activo, el panel muestra **Apagar desde el móvil** con un QR. Escánelo con la cámara (teléfono y Mac en la **misma Wi‑Fi**): abre una página local y Despierto vuelve a lo normal. No hace falta internet; el enlace lleva un token y solo funciona mientras la app está abierta y activa.
 
 ## Cómo funciona
 

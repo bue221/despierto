@@ -22,6 +22,7 @@ App de barra de menú de macOS. Se usa en segundos, justo antes de levantarse. C
 - Duraciones: 15 min, 30 min, 1 h, 2 h o sin límite. El temporizador lo lleva un proceso del sistema y funciona con la tapa cerrada.
 - Detecta Claude Code, Cursor, Codex y Antigravity (`agy`) si están abiertos. Un proceso abierto no significa que esté trabajando.
 - Seguir en el móvil: selector Claude / Cursor / Codex con QR y comando copiable. Claude sigue usando sesiones con bridge; Cursor y Codex usan sus portales oficiales.
+- Apagar desde el móvil: con el modo activo, un QR en la LAN local (misma Wi‑Fi, token) llama a «volver a lo normal».
 - Con Despierto activo y tapa cerrada, pone el brillo del panel a 0 y lo restaura al abrir (ahorro de pantalla/batería, no de RAM).
 - macOS 13 o posterior.
 
