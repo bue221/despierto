@@ -983,7 +983,9 @@ enum System {
             let name = String(cString: iface.pointee.ifa_name)
             guard name.hasPrefix("en") || name.hasPrefix("bridge") else { continue }
             var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            let result = getnameinfo(iface.pointee.ifa_addr, socklen_t(iface.pointee.ifa_addr.pointee.sa_len),
+            let saLen = iface.pointee.ifa_addr.pointee.sa_len
+            let addrLen = saLen > 0 ? socklen_t(saLen) : socklen_t(MemoryLayout<sockaddr_in>.size)
+            let result = getnameinfo(iface.pointee.ifa_addr, addrLen,
                                      &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
             guard result == 0 else { continue }
             let ip = String(cString: hostname)
@@ -1187,9 +1189,8 @@ struct PanelView: View {
                 if model.agentsOpen {
                     AgentsRow().transition(.opacity)
                 }
-                if model.isAwake, model.remoteStopURL != nil {
-                    RemoteStopRow().transition(.opacity)
-                }
+                // Siempre visible: si aún no está activo, indica que hay que elegir un tiempo.
+                RemoteStopRow().transition(.opacity)
                 PhoneRow()
             }
             if let error = model.errorMessage {
@@ -1489,21 +1490,32 @@ struct AgentsRow: View {
 struct RemoteStopRow: View {
     @EnvironmentObject var model: Despierto
 
+    private var subtitle: String {
+        if !model.isAwake {
+            return "Primero elige un tiempo arriba (15 min, 30 min…). Luego aparece el QR aquí."
+        }
+        if model.remoteStopURL == nil {
+            return "Conecta el Mac a una Wi‑Fi (misma que el celular) para generar el QR."
+        }
+        return "Misma Wi‑Fi que el Mac. Escanéalo cuando termines: Despierto vuelve a lo normal."
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "power.circle")
+            Image(systemName: model.isAwake && model.remoteStopURL != nil ? "power.circle.fill" : "power.circle")
                 .font(.system(size: 14, weight: .semibold))
                 .frame(width: 20)
             VStack(alignment: .leading, spacing: 2) {
                 Text("Apagar desde el móvil")
                     .font(.system(size: 13, weight: .semibold))
-                Text("Misma Wi‑Fi. Escanéalo cuando termines y Despierto vuelve a lo normal.")
+                Text(subtitle)
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                    .textMorph()
             }
             Spacer(minLength: 0)
-            if let url = model.remoteStopURL, let qr = QR.image(for: url) {
+            if model.isAwake, let url = model.remoteStopURL, let qr = QR.image(for: url) {
                 Image(decorative: qr, scale: 1)
                     .interpolation(.none)
                     .resizable()
